@@ -49,4 +49,18 @@ describe("loadConfig", () => {
     const bad = { ...minimal, twilio: { ...minimal.twilio, fromNumber: "5550001111" } };
     expect(() => loadConfig({ home: homeWith(bad), env: {} })).toThrow(/E\.164|fromNumber/);
   });
+
+  it("throws a readable error when controlToken is an empty string", () => {
+    const bad = { ...minimal, serve: { controlToken: "" } };
+    expect(() => loadConfig({ home: homeWith(bad), env: {} })).toThrow(/controlToken/);
+  });
+
+  it("does not let an empty-string env var wipe out a valid file credential", () => {
+    const cfg = loadConfig({
+      home: homeWith(minimal),
+      env: { PI_VOICE_CONTROL_TOKEN: "", TWILIO_AUTH_TOKEN: "" }
+    });
+    expect(cfg.serve.controlToken).toBe("secret");
+    expect(cfg.twilio.authToken).toBe("tok");
+  });
 });

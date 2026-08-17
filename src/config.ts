@@ -7,12 +7,12 @@ const E164 = /^\+[1-9]\d{6,14}$/;
 
 const configSchema = z.object({
   twilio: z.object({
-    accountSid: z.string(),
-    authToken: z.string(),
+    accountSid: z.string().min(1, "twilio.accountSid is required"),
+    authToken: z.string().min(1, "twilio.authToken is required"),
     fromNumber: z.string().regex(E164, "fromNumber must be in E.164 format (e.g. +15550001111)")
   }),
   openai: z.object({
-    apiKey: z.string(),
+    apiKey: z.string().min(1, "openai.apiKey is required"),
     realtimeModel: z.string().default("gpt-realtime"),
     voice: z.string().default("alloy")
   }),
@@ -22,7 +22,9 @@ const configSchema = z.object({
     publicPort: z.number().default(3334),
     publicUrl: z.string().optional(),
     tunnel: z.enum(["cloudflared", "ngrok", "none"]).default("cloudflared"),
-    controlToken: z.string({ required_error: "serve.controlToken is required" })
+    controlToken: z
+      .string({ required_error: "serve.controlToken is required" })
+      .min(1, "serve.controlToken is required")
   }),
   limits: z
     .object({
@@ -73,6 +75,10 @@ export function loadConfig(opts?: { home?: string; env?: Record<string, string |
   return { home, ...result.data };
 }
 
+// Env vars overlay the file config only when set to a non-empty string, so an
+// accidentally-blank env var (e.g. `export PI_VOICE_CONTROL_TOKEN=` in a
+// wrapper script) falls back to the file value instead of silently wiping
+// out a valid credential.
 function applyEnvOverlay(raw: unknown, env: Record<string, string | undefined>): unknown {
   const base = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
   const twilio = (typeof base.twilio === "object" && base.twilio !== null ? base.twilio : {}) as Record<
@@ -92,16 +98,16 @@ function applyEnvOverlay(raw: unknown, env: Record<string, string | undefined>):
     ...base,
     twilio: {
       ...twilio,
-      ...(env.TWILIO_ACCOUNT_SID !== undefined ? { accountSid: env.TWILIO_ACCOUNT_SID } : {}),
-      ...(env.TWILIO_AUTH_TOKEN !== undefined ? { authToken: env.TWILIO_AUTH_TOKEN } : {})
+      ...(env.TWILIO_ACCOUNT_SID ? { accountSid: env.TWILIO_ACCOUNT_SID } : {}),
+      ...(env.TWILIO_AUTH_TOKEN ? { authToken: env.TWILIO_AUTH_TOKEN } : {})
     },
     openai: {
       ...openai,
-      ...(env.OPENAI_API_KEY !== undefined ? { apiKey: env.OPENAI_API_KEY } : {})
+      ...(env.OPENAI_API_KEY ? { apiKey: env.OPENAI_API_KEY } : {})
     },
     serve: {
       ...serve,
-      ...(env.PI_VOICE_CONTROL_TOKEN !== undefined ? { controlToken: env.PI_VOICE_CONTROL_TOKEN } : {})
+      ...(env.PI_VOICE_CONTROL_TOKEN ? { controlToken: env.PI_VOICE_CONTROL_TOKEN } : {})
     }
   };
 }
