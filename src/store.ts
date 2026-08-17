@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CallRecord } from "./types.js";
@@ -12,7 +13,13 @@ export class CallStore {
   async save(rec: CallRecord): Promise<void> {
     await mkdir(this.callsDir, { recursive: true });
     const filePath = this.pathFor(rec.id);
-    const tmpPath = `${filePath}.tmp`;
+    // Per-writer unique tmp path: overlapping save() calls for the same record id
+    // (e.g. a Twilio status webhook and the realtime stream session both mutating
+    // the same CallRecord) must not share one tmp file, which would let one
+    // writer's rename() steal the other's tmp path out from under it (ENOENT) or
+    // splice partially-written content. The ".json" suffix filter in list() keeps
+    // this suffix invisible to readers.
+    const tmpPath = `${filePath}.${randomUUID()}.tmp`;
     await writeFile(tmpPath, JSON.stringify(rec, null, 2), "utf-8");
     await rename(tmpPath, filePath);
   }
@@ -45,12 +52,22 @@ export class CallStore {
       files
         .filter((file) => file.endsWith(".json"))
         .map(async (file) => {
-          const raw = await readFile(join(this.callsDir, file), "utf-8");
-          return JSON.parse(raw) as CallRecord;
+          // A record that can't be read or parsed (e.g. corrupted, or caught
+          // mid-write) is skipped rather than failing the whole listing — one
+          // bad file must not permanently break list(), findByProviderCallId(),
+          // or the daily-cap check in countCreatedToday().
+          try {
+            const raw = await readFile(join(this.callsDir, file), "utf-8");
+            return JSON.parse(raw) as CallRecord;
+          } catch {
+            return undefined;
+          }
         })
     );
 
-    return records.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    return records
+      .filter((rec): rec is CallRecord => rec !== undefined)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
   }
 
   async countCreatedToday(now: Date = new Date()): Promise<number> {

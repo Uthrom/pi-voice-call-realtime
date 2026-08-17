@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID, randomBytes } from "node:crypto";
@@ -95,5 +95,57 @@ describe("CallStore", () => {
     await store.save(makeRecord({ createdAt: yesterday.toISOString() }));
 
     expect(await store.countCreatedToday()).toBe(0);
+  });
+
+  it("two concurrent save()s of the same record id both resolve and leave a parseable file", async () => {
+    const store = new CallStore(tempDir());
+    const id = randomUUID();
+    const recA = makeRecord({ id, summary: "first write" });
+    const recB = makeRecord({ id, summary: "second write" });
+
+    await Promise.all([store.save(recA), store.save(recB)]);
+
+    const got = await store.get(id);
+    expect(got).toBeDefined();
+    expect([recA, recB]).toContainEqual(got);
+  });
+
+  it("list skips a hand-planted file that fails to parse as JSON", async () => {
+    const dir = tempDir();
+    const store = new CallStore(dir);
+    const good = makeRecord();
+    await store.save(good);
+
+    mkdirSync(join(dir, "calls"), { recursive: true });
+    writeFileSync(join(dir, "calls", `${randomUUID()}.json`), "{not valid json");
+
+    const list = await store.list();
+
+    expect(list.map((r) => r.id)).toEqual([good.id]);
+  });
+
+  it("countCreatedToday ignores a hand-planted file that fails to parse as JSON", async () => {
+    const dir = tempDir();
+    const store = new CallStore(dir);
+    await store.save(makeRecord({ createdAt: new Date().toISOString() }));
+
+    mkdirSync(join(dir, "calls"), { recursive: true });
+    writeFileSync(join(dir, "calls", `${randomUUID()}.json`), "{not valid json");
+
+    expect(await store.countCreatedToday()).toBe(1);
+  });
+
+  it("list ignores a stray .tmp file left behind by an in-flight save", async () => {
+    const dir = tempDir();
+    const store = new CallStore(dir);
+    const good = makeRecord();
+    await store.save(good);
+
+    mkdirSync(join(dir, "calls"), { recursive: true });
+    writeFileSync(join(dir, "calls", "x.json.tmp"), JSON.stringify(good));
+
+    const list = await store.list();
+
+    expect(list.map((r) => r.id)).toEqual([good.id]);
   });
 });
