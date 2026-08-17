@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-17
 **Status:** Draft for review
-**Project:** `pi-dialpad-voice-agent-realtime`
+**Project:** `pi-voice-call-realtime`
 
 ## 1. Purpose
 

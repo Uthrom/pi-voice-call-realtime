@@ -1,4 +1,4 @@
-# pi-dialpad-voice-agent-realtime
+# pi-voice-call-realtime
 
 A realtime phone voice agent for [pi](https://pi.dev): a pi agent places outbound calls (scheduling, reservations, vendor calls), holds a natural voice conversation via Twilio Media Streams + the OpenAI Realtime API, and reports the outcome back to the pi session. Later phases add inbound calling on a Dialpad number.
 
