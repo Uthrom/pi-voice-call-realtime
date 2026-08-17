@@ -109,7 +109,7 @@ The realtime model is a tool-poor "voice actor"; the pi agent is the brain that 
 
 **New code (~1–1.5k LOC):** daemon entry + control API (`server.ts`), pi extension (`voice-call.ts`), prompt assembly (`call-brain.ts`), post-call summarizer (`summary.ts`), Zod config loader (`config.ts`), types.
 
-**Dependencies** (mirroring the reference repo's minimalism): `ws`, `zod`, `@sinclair/typebox`; `@earendil-works/pi-ai` for the summary LLM call; dev: `vitest`, `typescript`, `tsx`. No Twilio SDK. The extension file itself has no deps beyond what pi provides.
+**Dependencies** (mirroring the reference repo's minimalism): `ws`, `zod`; dev: `vitest`, `typescript`, `tsx`. No Twilio SDK. Post-call summaries call the OpenAI chat-completions API directly with `fetch` (same key as Realtime) rather than adding an LLM-client dependency. The extension file itself has no deps beyond what pi provides (`@sinclair/typebox`).
 
 ## 6. Configuration
 
