@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { WebSocketServer, WebSocket } from "ws";
 import type { AddressInfo } from "node:net";
 import { RealtimeSession } from "../src/realtime.js";
@@ -303,7 +303,96 @@ describe("RealtimeSession", () => {
     expect(elapsed).toBeLessThan(1000);
   });
 
+  it("after an ack-timeout rejection, the rejected socket is torn down — the server side observes it close", async () => {
+    const { server, url } = await startServer();
+    let serverSawClose = false;
+    const serverClosed = deferred<void>();
+    server.once("connection", (socket: WebSocket) => {
+      // Deliberately never reply — simulates the API silently ignoring
+      // session.update. If the rejected client socket isn't torn down
+      // (task-9 review round 2), the server side never sees a close either.
+      socket.once("close", () => {
+        serverSawClose = true;
+        serverClosed.resolve();
+      });
+    });
+
+    const session = new RealtimeSession({
+      apiKey: TEST_API_KEY,
+      model: "gpt-realtime",
+      voice: "alloy",
+      instructions: "hi",
+      tools: [],
+      callbacks: NOOP_CALLBACKS,
+      urlOverride: url,
+      connectTimeoutMs: 40
+    });
+
+    await expect(session.connect()).rejects.toThrow(/timed out/i);
+    await withTimeout(serverClosed.promise, 500, undefined);
+
+    expect(serverSawClose).toBe(true);
+  });
+
+  it("a stale socket rejected via an error event cannot mutate a subsequently succeeded connection (round-2 regression)", async () => {
+    const { server, url } = await startServer();
+    const sockets: WebSocket[] = [];
+    let connectionCount = 0;
+    server.on("connection", (socket: WebSocket) => {
+      connectionCount++;
+      const isFirstAttempt = connectionCount === 1;
+      sockets.push(socket);
+      socket.on("message", (data: Buffer) => {
+        const msg = JSON.parse(data.toString()) as { type?: string };
+        if (msg.type !== "session.update") return;
+        if (isFirstAttempt) {
+          // Attempt 1: the API rejects the session config with an error
+          // event, deliberately leaving the socket open (matches the real
+          // API's behavior, and the scenario the round-2 review proved was
+          // exploitable).
+          socket.send(JSON.stringify({ type: "error", error: { code: "invalid_request", message: "bad config" } }));
+        } else {
+          socket.send(JSON.stringify({ type: "session.updated", session: {} }));
+        }
+      });
+    });
+
+    const onAudioDelta = vi.fn();
+    const onClosed = vi.fn();
+    const session = new RealtimeSession({
+      apiKey: TEST_API_KEY,
+      model: "gpt-realtime",
+      voice: "alloy",
+      instructions: "hi",
+      tools: [],
+      callbacks: { ...NOOP_CALLBACKS, onAudioDelta, onClosed },
+      urlOverride: url
+    });
+
+    await expect(session.connect()).rejects.toThrow(); // attempt 1: rejected via error event
+    await session.connect(); // attempt 2: succeeds
+
+    expect(connectionCount).toBe(2);
+    const staleSocket = sockets[0];
+
+    // The stale (attempt 1) socket delivering an audio delta must not reach
+    // the live session's callback.
+    staleSocket.send(
+      JSON.stringify({ type: "response.output_audio.delta", delta: Buffer.from([0x01]).toString("base64") })
+    );
+    await new Promise((r) => setTimeout(r, 60));
+    expect(onAudioDelta).not.toHaveBeenCalled();
+
+    // The stale socket later closing must not tear down the live session:
+    // no onClosed, ended stays false, no reconnect bookkeeping disturbed.
+    staleSocket.close(1000, "stale close");
+    await new Promise((r) => setTimeout(r, 60));
+    expect(session.ended).toBe(false);
+    expect(onClosed).not.toHaveBeenCalled();
+  });
+
   it("a throwing onAudioDelta does not crash the session — a later event still dispatches", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     let calls = 0;
     const got = deferred<Buffer | undefined>();
     const { socket } = await connectedSession({
@@ -325,6 +414,8 @@ describe("RealtimeSession", () => {
     expect(Buffer.isBuffer(received)).toBe(true);
     expect((received as Buffer).equals(audioBytes2)).toBe(true);
     expect(calls).toBe(2);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
   });
 
   it("appendAudio base64-frames the raw mu-law buffer with zero transcoding", async () => {
@@ -548,6 +639,7 @@ describe("ManagedRealtimeSession", () => {
   });
 
   it("a throwing outer onAudioDelta does not crash the managed session — a later event still dispatches", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { server, url } = await startServer();
     let socketRef: WebSocket | undefined;
     server.once("connection", (socket: WebSocket) => {
@@ -587,6 +679,8 @@ describe("ManagedRealtimeSession", () => {
     expect(Buffer.isBuffer(received)).toBe(true);
     expect((received as Buffer).equals(audioBytes2)).toBe(true);
     expect(calls).toBe(2);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
 
     session.close();
   });

@@ -25,7 +25,10 @@
  * whichever comes first. Every callback dispatch is exception-safe — a
  * throwing onAudioDelta/onToolCall/etc. (e.g. a dead Twilio socket, a pi
  * SDK dispatch failure) is caught and warned, never left to crash the
- * process.
+ * process. A socket that loses the race to settle connect() (a stale
+ * attempt superseded by a reconnect, or one torn down on rejection) can
+ * never mutate live-session state afterward — every handler is bound to
+ * its own socket instance and a rejection tears that socket down.
  */
 
 import { WebSocket } from "ws";
@@ -131,7 +134,18 @@ export class RealtimeSession {
    * API acknowledges it with `session.updated` — never on the socket merely
    * opening. Rejects if the socket errors or closes first, if the API
    * responds with an `error` event instead of an ack (socket left open),
-   * or if session.updated never arrives within connectTimeoutMs. */
+   * or if session.updated never arrives within connectTimeoutMs.
+   *
+   * Every handler below is bound to one specific socket instance (`ws`,
+   * captured per call) and starts with `if (this.ws !== ws) return;` — once
+   * a later connect() call (a reconnect) replaces `this.ws`, this socket is
+   * stale and none of its events may touch live-session state again,
+   * regardless of what order things settle in. Rejection additionally tears
+   * the stale socket down (removeAllListeners + terminate) so it can't keep
+   * dispatching events at all, rather than relying solely on the guard. See
+   * task-9 review round 2: a rejected-but-not-torn-down socket could keep
+   * delivering audio deltas, or later fire a close event that clobbered a
+   * subsequently-succeeded reconnect's state. */
   async connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this._ended = false;
@@ -144,17 +158,21 @@ export class RealtimeSession {
       this.ws = ws;
 
       this.connectTimer = setTimeout(() => {
+        if (this.ws !== ws) return;
         this.rejectConnect(
-          new Error(`OpenAI Realtime connection timed out waiting for session.updated (${this.connectTimeoutMs}ms)`)
+          new Error(`OpenAI Realtime connection timed out waiting for session.updated (${this.connectTimeoutMs}ms)`),
+          ws
         );
       }, this.connectTimeoutMs);
       this.connectTimer.unref?.();
 
       ws.on("open", () => {
+        if (this.ws !== ws) return;
         this.send({ type: "session.update", session: this.buildSessionConfig() });
       });
 
       ws.on("message", (data: Buffer) => {
+        if (this.ws !== ws) return;
         let event: RealtimeEvent;
         try {
           event = JSON.parse(data.toString()) as RealtimeEvent;
@@ -163,7 +181,7 @@ export class RealtimeSession {
           // can carry caller speech content. Drop it silently.
           return;
         }
-        this.safeHandleEvent(event);
+        this.safeHandleEvent(event, ws);
       });
 
       // A generic connection-level failure (DNS, TLS, refused handshake).
@@ -171,12 +189,14 @@ export class RealtimeSession {
       // onClosed bookkeeping, to avoid firing onClosed twice for one
       // failure.
       ws.on("error", () => {
-        this.rejectConnect(new Error("OpenAI Realtime connection failed"));
+        if (this.ws !== ws) return;
+        this.rejectConnect(new Error("OpenAI Realtime connection failed"), ws);
       });
 
       ws.on("close", (code: number, reasonBuf: Buffer) => {
+        if (this.ws !== ws) return;
         const reason = describeClose(code, reasonBuf);
-        this.rejectConnect(new Error(`OpenAI Realtime connection closed before session.updated (${reason})`));
+        this.rejectConnect(new Error(`OpenAI Realtime connection closed before session.updated (${reason})`), ws);
         this._ended = true;
         this.safeOnClosed(reason);
       });
@@ -258,9 +278,9 @@ export class RealtimeSession {
   // into the `ws` message emitter and crash the process — see task-9
   // review issue 3. A caught throw is warned (never logs the raw event,
   // which can carry caller speech content or a payload the API echoed).
-  private safeHandleEvent(event: RealtimeEvent): void {
+  private safeHandleEvent(event: RealtimeEvent, ws: WebSocket): void {
     try {
-      this.handleEvent(event);
+      this.handleEvent(event, ws);
     } catch (err) {
       console.warn("[realtime] callback error:", err);
     }
@@ -274,7 +294,7 @@ export class RealtimeSession {
     }
   }
 
-  private handleEvent(event: RealtimeEvent): void {
+  private handleEvent(event: RealtimeEvent, ws: WebSocket): void {
     switch (event.type) {
       case "session.updated":
         this.resolveConnect();
@@ -291,7 +311,7 @@ export class RealtimeSession {
       // they're ignored.
       case "error":
         if (this.connectReject) {
-          this.rejectConnect(new Error(describeApiError(event)));
+          this.rejectConnect(new Error(describeApiError(event)), ws);
         }
         break;
 
@@ -341,10 +361,20 @@ export class RealtimeSession {
     resolve();
   }
 
-  private rejectConnect(err: Error): void {
+  // Rejects the in-flight connect() promise (if one is still pending) and
+  // tears the rejected socket down so it can never dispatch another event
+  // or fire a close that mutates a since-superseded live session (task-9
+  // review round 2). Safe to call from a handler whose socket has already
+  // naturally closed (removeAllListeners/terminate on an already-closed
+  // socket is a harmless no-op) and safe to call post-connect (the
+  // `!this.connectReject` guard makes it a no-op — an active connection's
+  // own eventual close must not be torn down here, only reported via
+  // safeOnClosed by the caller).
+  private rejectConnect(err: Error, ws: WebSocket): void {
     if (!this.connectReject) return;
     const reject = this.connectReject;
     this.clearConnectSettlers();
+    this.teardownSocket(ws);
     reject(err);
   }
 
@@ -355,6 +385,11 @@ export class RealtimeSession {
     }
     this.connectResolve = undefined;
     this.connectReject = undefined;
+  }
+
+  private teardownSocket(ws: WebSocket): void {
+    ws.removeAllListeners();
+    ws.terminate();
   }
 
   private send(payload: unknown): void {
