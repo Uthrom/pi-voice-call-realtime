@@ -2,19 +2,32 @@
 // `.pi/extensions/` or `~/.pi/agent/extensions/`, independent of this repo's
 // own module graph. Must import NOTHING from `src/`; the wire types it needs
 // are re-declared locally in `./client.js` (same isolation rule, documented
-// there). `@sinclair/typebox` is the one exception — pi's own environment
-// provides it at load time, which is why it's a devDependency here (for
-// local type-checking/tests) rather than a runtime `dependency` of this
-// package (global-constraints.md: runtime deps are exactly `ws` and `zod`).
+// there).
 //
 // This file is deliberately thin: every bit of actual logic (polling,
-// timeout handling, error-message mapping, result shaping) lives in
-// `VoiceBridgeClient` (./client.ts), which is unit-tested. This file is
-// wiring only, exercised live by loading it into a real pi session — there
-// is no unit test for it.
+// timeout handling, error-message mapping, result shaping, streamToken
+// projection) lives in `VoiceBridgeClient` (./client.ts), which is
+// unit-tested. This file is wiring only.
+//
+// The `PiExtensionApi`/`PiToolResult`/`PiCommandContext` shapes below are
+// verified against pi's published docs (https://pi.dev/docs/latest/extensions,
+// fetched during review) — registerTool/registerCommand, the 5-arg execute
+// signature, and the notify-based command output are all taken from there,
+// not guessed. What is NOT verified: there is no pi installation on this
+// machine to actually load this file into, so the docs are the only
+// evidence backing this surface — see task-15-report.md's fix log.
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+// Controller ruling: keep `@sinclair/typebox` (global-constraints.md
+// sanctions it as the one thing this extension may import from "pi's own
+// environment"). pi's own docs (https://pi.dev/docs/latest/extensions) also
+// schema tool parameters with "typebox". It resolves here because Task 16's
+// README mandates installing this extension by *symlinking*
+// extension/voice-call.ts into ~/.pi/agent/extensions/ — Node's module
+// resolution walks up from the symlink's real path (this repo) to find
+// node_modules, where the devDependency below actually lives. Installing by
+// plain copy instead of a symlink would break that resolution.
 import { Type, type Static } from "@sinclair/typebox";
 import { VoiceBridgeClient, type CallParamsInput } from "./client.js";
 
@@ -48,22 +61,51 @@ const voiceCallParams = Type.Object({
 type VoiceCallToolInput = Static<typeof voiceCallParams>;
 
 // Minimal structural shape of the pi extension API this file actually
-// touches (tool + command registration). Not the full pi SDK surface — pi's
-// real extension-context object satisfies this structurally, which is all
-// TypeScript needs here.
+// touches, per https://pi.dev/docs/latest/extensions:
+// - `pi.registerTool({...})`, not `pi.tool(...)`.
+// - A tool's `execute` is `(toolCallId, params, signal, onUpdate, ctx)` —
+//   params is the SECOND argument, not the first.
+// - `pi.registerCommand(name, {...})`, not `pi.command(...)`; a command's
+//   `handler` returns void and produces output via `ctx.ui.notify(...)`, not
+//   via a return value.
 interface PiToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+  label?: string;
+}
+
+interface PiToolExecuteContext {
+  // Opaque to this file — never read, only threaded through so the
+  // positional signature below matches pi's real one.
+  [key: string]: unknown;
+}
+
+interface PiCommandContext {
+  ui: {
+    notify(text: string, level?: "info" | "warn" | "error"): void;
+  };
 }
 
 interface PiExtensionApi {
-  tool(def: {
+  registerTool(def: {
     name: string;
     description: string;
     parameters: typeof voiceCallParams;
-    execute: (input: VoiceCallToolInput) => Promise<PiToolResult>;
+    execute: (
+      toolCallId: string,
+      params: VoiceCallToolInput,
+      signal: AbortSignal,
+      onUpdate: (update: unknown) => void,
+      ctx: PiToolExecuteContext
+    ) => Promise<PiToolResult>;
   }): void;
-  command(def: { name: string; description: string; execute: () => Promise<PiToolResult> }): void;
+  registerCommand(
+    name: string,
+    def: {
+      description: string;
+      handler: (args: unknown, ctx: PiCommandContext) => Promise<void>;
+    }
+  ): void;
 }
 
 interface VoiceExtensionConfig {
@@ -76,9 +118,9 @@ const DEFAULT_CONTROL_PORT = 3335; // mirrors config.ts's serve.controlPort defa
 /**
  * Reads `~/.pi-voice/config.json` (the same file the daemon loads via
  * `loadConfig()`) for just the two fields this extension needs. Read lazily
- * — called from inside each tool/command's `execute`, never at module load —
- * so a missing/invalid config surfaces as a friendly tool error on first use
- * rather than an extension that fails to load at all.
+ * — called from inside each tool/command's execute/handler, never at module
+ * load — so a missing/invalid config surfaces as a friendly tool error on
+ * first use rather than an extension that fails to load at all.
  */
 function readVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceExtensionConfig {
   const home = env.PI_VOICE_HOME ?? join(homedir(), ".pi-voice");
@@ -117,14 +159,6 @@ function clientFromConfig(): VoiceBridgeClient {
   return new VoiceBridgeClient({ baseUrl: `http://127.0.0.1:${cfg.controlPort}`, token: cfg.controlToken });
 }
 
-function textResult(text: string): PiToolResult {
-  return { content: [{ type: "text", text }] };
-}
-
-function errorResult(err: unknown): PiToolResult {
-  return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
-}
-
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -147,6 +181,9 @@ async function runVoiceCallAction(client: VoiceBridgeClient, input: VoiceCallToo
       return JSON.stringify(result, null, 2);
     }
     case "get_status": {
+      // client.getStatus() already returns a projected CallRecordLike (no
+      // streamToken, no other unlisted wire field) — see client.ts's
+      // projectCallRecord(). Safe to stringify directly.
       const rec = await client.getStatus(input.call_id);
       return rec ? JSON.stringify(rec, null, 2) : "No active or recent call.";
     }
@@ -167,33 +204,33 @@ async function runVoiceCallAction(client: VoiceBridgeClient, input: VoiceCallToo
 }
 
 export default function registerVoiceCallExtension(pi: PiExtensionApi): void {
-  pi.tool({
+  pi.registerTool({
     name: "voice_call",
     description:
       "Place and manage outbound phone calls through the local voice-bridge daemon. " +
       "initiate_call blocks until the call completes and returns its outcome.",
     parameters: voiceCallParams,
-    execute: async (input) => {
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       try {
         const client = clientFromConfig();
-        const text = await runVoiceCallAction(client, input);
-        return textResult(text);
+        const text = await runVoiceCallAction(client, params);
+        return { content: [{ type: "text", text }], label: params.action };
       } catch (err) {
-        return errorResult(err);
+        return { content: [{ type: "text", text: errorMessage(err) }], isError: true, label: params.action };
       }
     }
   });
 
-  pi.command({
-    name: "call-status",
+  pi.registerCommand("call-status", {
     description: "Show the status of the active or most recent outbound call.",
-    execute: async () => {
+    handler: async (_args, ctx) => {
       try {
         const client = clientFromConfig();
+        // Same projected-record guarantee as the get_status tool action above.
         const rec = await client.getStatus();
-        return textResult(rec ? JSON.stringify(rec, null, 2) : "No active or recent call.");
+        ctx.ui.notify(rec ? JSON.stringify(rec, null, 2) : "No active or recent call.", "info");
       } catch (err) {
-        return errorResult(err);
+        ctx.ui.notify(errorMessage(err), "error");
       }
     }
   });

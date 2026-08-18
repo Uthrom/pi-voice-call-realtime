@@ -128,7 +128,7 @@ export class VoiceBridgeClient {
       return { status: "failed", error: message };
     }
 
-    let current = (await initiateRes.json()) as CallRecordLike;
+    let current = await this.parseRecord(initiateRes);
     const id = current.id;
     let elapsedMs = 0;
 
@@ -162,7 +162,7 @@ export class VoiceBridgeClient {
     if (!res.ok) {
       throw new Error(`unexpected response status ${res.status} from GET ${path}`);
     }
-    return (await res.json()) as CallRecordLike;
+    return this.parseRecord(res);
   }
 
   async getTranscript(callId: string): Promise<string> {
@@ -195,6 +195,15 @@ export class VoiceBridgeClient {
     } catch {
       return undefined;
     }
+  }
+
+  // Every raw record parsed off the wire — the POST /calls response and
+  // both getStatus() paths — goes through this single choke point, so
+  // projectCallRecord()'s field allowlist (no streamToken, nothing else
+  // unlisted) can never be accidentally skipped by a future call site.
+  private async parseRecord(res: Response): Promise<CallRecordLike> {
+    const raw = (await res.json()) as Record<string, unknown>;
+    return projectCallRecord(raw);
   }
 
   private async request(method: string, path: string, body?: unknown): Promise<Response> {
@@ -239,6 +248,39 @@ function computeDurationSec(answeredAt: string | undefined, endedAt: string | un
   const ms = new Date(endedAt).getTime() - new Date(answeredAt).getTime();
   if (!Number.isFinite(ms) || ms < 0) return undefined;
   return Math.round(ms / 1000);
+}
+
+/**
+ * Builds a `CallRecordLike` by explicitly picking its declared fields off a
+ * raw parsed record — never a spread, never a blind `as CallRecordLike`
+ * cast of the whole object. The daemon's real `CallRecord` (src/types.ts)
+ * also carries `streamToken` — the sole bearer credential gating the public
+ * WS upgrade for that call, live for the duration of the call — and that
+ * must never reach a model prompt, transcript, or log
+ * (global-constraints.md). `getStatus()`'s result flows straight into
+ * `voice_call`'s tool/command output, so an explicit pick here (rather than
+ * trusting a cast) means a stray field on the runtime object — `streamToken`
+ * or anything else the wire happens to send — can never ride along.
+ */
+export function projectCallRecord(raw: Record<string, unknown>): CallRecordLike {
+  const rawOutcome = raw.outcome as Record<string, unknown> | undefined;
+  return {
+    id: raw.id as string,
+    providerCallId: raw.providerCallId as string | undefined,
+    status: raw.status as CallStatus,
+    createdAt: raw.createdAt as string | undefined,
+    answeredAt: raw.answeredAt as string | undefined,
+    endedAt: raw.endedAt as string | undefined,
+    amdResult: raw.amdResult as "human" | "machine" | undefined,
+    outcome:
+      rawOutcome && typeof rawOutcome === "object"
+        ? { outcome: rawOutcome.outcome as string, details: rawOutcome.details as string | undefined }
+        : undefined,
+    summary: raw.summary as string | undefined,
+    transcriptPath: raw.transcriptPath as string | undefined,
+    error: raw.error as string | undefined,
+    endReason: raw.endReason as string | undefined
+  };
 }
 
 async function extractErrorMessage(res: Response): Promise<string> {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { VoiceBridgeClient } from "../extension/client.js";
+import { VoiceBridgeClient, projectCallRecord } from "../extension/client.js";
 
 interface CapturedRequest {
   url: string;
@@ -194,6 +194,81 @@ describe("VoiceBridgeClient", () => {
       const client = new VoiceBridgeClient({ baseUrl, token, fetchImpl });
 
       await expect(client.getStatus("unknown-id")).resolves.toBeUndefined();
+    });
+
+    // streamToken is the daemon's sole bearer credential for the public WS
+    // upgrade of that call (global-constraints.md: secrets never appear in
+    // model prompts, transcripts, or logs) — but the daemon's real
+    // CallRecord carries it, and getStatus()'s result flows straight into
+    // voice_call's tool/command JSON output. Regression coverage for that
+    // leak, independent of the projectCallRecord() unit test below.
+    it("never leaks streamToken even though the daemon's raw record includes it", async () => {
+      const { fetchImpl } = scriptedFetch([
+        {
+          status: 200,
+          body: JSON.stringify({ id: "call-10", status: "in-progress", streamToken: "leak-me-not" })
+        }
+      ]);
+      const client = new VoiceBridgeClient({ baseUrl, token, fetchImpl });
+
+      const rec = await client.getStatus("call-10");
+
+      expect(rec).toEqual({ id: "call-10", status: "in-progress" });
+      expect(rec).not.toHaveProperty("streamToken");
+    });
+  });
+
+  describe("projectCallRecord", () => {
+    it("keeps only CallRecordLike's declared fields, dropping streamToken and any other unknown wire field", () => {
+      const raw = {
+        id: "call-11",
+        status: "answered",
+        streamToken: "super-secret-stream-token",
+        params: { to: "+15550001111", objective: "book a table" },
+        unexpectedField: "whatever the daemon might one day add"
+      };
+
+      const projected = projectCallRecord(raw);
+
+      expect(projected).toEqual({ id: "call-11", status: "answered" });
+      expect(Object.keys(projected)).not.toContain("streamToken");
+      expect(Object.keys(projected)).not.toContain("params");
+      expect(Object.keys(projected)).not.toContain("unexpectedField");
+    });
+
+    it("keeps every declared field, including a nested outcome, when present", () => {
+      const raw = {
+        id: "call-12",
+        providerCallId: "CAxxxx",
+        status: "completed",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        answeredAt: "2026-01-01T00:00:05.000Z",
+        endedAt: "2026-01-01T00:00:35.000Z",
+        amdResult: "human",
+        outcome: { outcome: "reservation-confirmed", details: "Thursday 7pm" },
+        summary: "Booked a table.",
+        transcriptPath: "/tmp/call-12.md",
+        error: undefined,
+        endReason: "operator",
+        streamToken: "leak-me-not"
+      };
+
+      const projected = projectCallRecord(raw);
+
+      expect(projected).toEqual({
+        id: "call-12",
+        providerCallId: "CAxxxx",
+        status: "completed",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        answeredAt: "2026-01-01T00:00:05.000Z",
+        endedAt: "2026-01-01T00:00:35.000Z",
+        amdResult: "human",
+        outcome: { outcome: "reservation-confirmed", details: "Thursday 7pm" },
+        summary: "Booked a table.",
+        transcriptPath: "/tmp/call-12.md",
+        endReason: "operator"
+      });
+      expect(projected).not.toHaveProperty("streamToken");
     });
   });
 
