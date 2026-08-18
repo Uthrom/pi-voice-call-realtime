@@ -1,0 +1,196 @@
+import { describe, it, expect } from "vitest";
+import { summarizeCall } from "../src/summary.js";
+
+interface CapturedRequest {
+  url: string;
+  init: RequestInit;
+}
+
+function fakeFetch(responses: Array<{ status: number; body: string }>): {
+  fetchImpl: typeof fetch;
+  requests: CapturedRequest[];
+} {
+  const requests: CapturedRequest[] = [];
+  let i = 0;
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    requests.push({ url: url.toString(), init: init ?? {} });
+    const r = responses[Math.min(i, responses.length - 1)];
+    i += 1;
+    return new Response(r.body, { status: r.status });
+  }) as typeof fetch;
+  return { fetchImpl, requests };
+}
+
+function chatCompletionBody(outcome: string, summary: string): string {
+  return JSON.stringify({ choices: [{ message: { content: JSON.stringify({ outcome, summary }) } }] });
+}
+
+describe("summarizeCall", () => {
+  it("POSTs to OpenAI chat completions with model/messages/response_format and returns the parsed result", async () => {
+    const { fetchImpl, requests } = fakeFetch([
+      {
+        status: 200,
+        body: chatCompletionBody(
+          "appointment confirmed",
+          "The caller confirmed their Tuesday appointment and asked for the address."
+        )
+      }
+    ]);
+
+    const result = await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "confirm the Tuesday appointment",
+      transcript: "assistant: Hi\ncaller: Sure, Tuesday works",
+      fetchImpl
+    });
+
+    expect(result).toEqual({
+      outcome: "appointment confirmed",
+      summary: "The caller confirmed their Tuesday appointment and asked for the address."
+    });
+
+    expect(requests).toHaveLength(1);
+    const req = requests[0]!;
+    expect(req.url).toBe("https://api.openai.com/v1/chat/completions");
+    expect(req.init.method).toBe("POST");
+    const headers = req.init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer sk-test-key");
+    expect(headers["Content-Type"]).toBe("application/json");
+
+    const body = JSON.parse(req.init.body as string);
+    expect(body.model).toBe("gpt-4o-mini");
+    expect(body.response_format).toEqual({ type: "json_object" });
+    expect(body.messages[0]).toEqual({
+      role: "system",
+      content: 'Summarize this phone call against its objective; reply as JSON {"outcome": one short line, "summary": 2-4 sentences}'
+    });
+    expect(body.messages[1].role).toBe("user");
+    expect(body.messages[1].content).toContain("confirm the Tuesday appointment");
+    expect(body.messages[1].content).toContain("assistant: Hi");
+  });
+
+  it("truncates the transcript to 12,000 chars before sending", async () => {
+    const { fetchImpl, requests } = fakeFetch([{ status: 200, body: chatCompletionBody("ok", "fine") }]);
+    const longTranscript = "x".repeat(20_000);
+
+    await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: longTranscript,
+      fetchImpl
+    });
+
+    const body = JSON.parse(requests[0]!.init.body as string);
+    const userContent = body.messages[1].content as string;
+    expect(userContent).toContain("x".repeat(12_000));
+    expect(userContent).not.toContain("x".repeat(12_001));
+  });
+
+  it("includes notedOutcome in the prompt when present", async () => {
+    const { fetchImpl, requests } = fakeFetch([{ status: 200, body: chatCompletionBody("ok", "fine") }]);
+
+    await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: "hi",
+      notedOutcome: { outcome: "voicemail-left", details: "left a message" },
+      fetchImpl
+    });
+
+    const body = JSON.parse(requests[0]!.init.body as string);
+    const userContent = body.messages[1].content as string;
+    expect(userContent).toContain("voicemail-left");
+    expect(userContent).toContain("left a message");
+  });
+
+  it("on a 500 API failure WITH a notedOutcome, echoes notedOutcome.outcome and the summary mentions the failure", async () => {
+    const { fetchImpl } = fakeFetch([{ status: 500, body: "Internal Server Error" }]);
+
+    const result = await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: "hi",
+      notedOutcome: { outcome: "voicemail-left" },
+      fetchImpl
+    });
+
+    expect(result.outcome).toBe("voicemail-left");
+    expect(result.summary.toLowerCase()).toContain("summary unavailable");
+  });
+
+  it("on a 500 API failure WITHOUT a notedOutcome, returns outcome 'unknown'", async () => {
+    const { fetchImpl } = fakeFetch([{ status: 500, body: "Internal Server Error" }]);
+
+    const result = await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: "hi",
+      fetchImpl
+    });
+
+    expect(result).toEqual({
+      outcome: "unknown",
+      summary: expect.stringContaining("Summary unavailable:")
+    });
+  });
+
+  it("never throws even when fetchImpl itself rejects (network failure)", async () => {
+    const throwingFetch = (async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:443");
+    }) as typeof fetch;
+
+    const result = await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: "hi",
+      fetchImpl: throwingFetch
+    });
+
+    expect(result.outcome).toBe("unknown");
+    expect(result.summary).toContain("connect ECONNREFUSED");
+  });
+
+  it("never throws when the model returns malformed JSON in its message content", async () => {
+    const { fetchImpl } = fakeFetch([
+      { status: 200, body: JSON.stringify({ choices: [{ message: { content: "not valid json" } }] }) }
+    ]);
+
+    const result = await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: "hi",
+      fetchImpl
+    });
+
+    expect(result.outcome).toBe("unknown");
+    expect(result.summary).toContain("Summary unavailable:");
+  });
+
+  // Controller note (task instructions): the API key must never appear in
+  // thrown/returned text or logs. Defense in depth: even a pathological
+  // fetchImpl error that happens to embed the key must not leak it back out.
+  it("never leaks the API key into the returned outcome/summary text, even if the underlying error embeds it", async () => {
+    const apiKey = "sk-super-secret-key";
+    const leakyFetch = (async () => {
+      throw new Error(`request failed, headers were Authorization: Bearer ${apiKey}`);
+    }) as typeof fetch;
+
+    const result = await summarizeCall({
+      apiKey,
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: "hi",
+      fetchImpl: leakyFetch
+    });
+
+    expect(result.outcome).not.toContain(apiKey);
+    expect(result.summary).not.toContain(apiKey);
+  });
+});
