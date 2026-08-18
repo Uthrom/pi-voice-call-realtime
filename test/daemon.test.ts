@@ -7,7 +7,13 @@ import { createServer as createNetServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import type { spawn } from "node:child_process";
 import { WebSocketServer, WebSocket } from "ws";
-import { startServer, formatBanner, createShutdownHandler, bootDaemon } from "../src/server.js";
+import {
+  startServer,
+  formatBanner,
+  createShutdownHandler,
+  bootDaemon,
+  waitForTunnelReady
+} from "../src/server.js";
 import type { Config } from "../src/config.js";
 import { CallStore } from "../src/store.js";
 import { RealtimeSession } from "../src/realtime.js";
@@ -498,6 +504,49 @@ describe("startServer(...).closeControl()", () => {
     // port above.
     const publicRes = await fetch(`http://127.0.0.1:${publicPort}/`);
     expect(publicRes.status).toBe(404);
+  });
+});
+
+describe("waitForTunnelReady", () => {
+  it("keeps polling through edge 502s and resolves true once our 404 appears", async () => {
+    const statuses = [502, 502, 404];
+    let calls = 0;
+    const fetchImpl = (async () => new Response("", { status: statuses[calls++] ?? 404 })) as typeof fetch;
+    const ready = await waitForTunnelReady("https://x.trycloudflare.com", {
+      timeoutMs: 5_000,
+      intervalMs: 1,
+      fetchImpl
+    });
+    expect(ready).toBe(true);
+    expect(calls).toBe(3);
+  });
+
+  it("treats connection errors as not-ready and keeps polling", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      if (calls < 3) throw new Error("connect ECONNREFUSED");
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    const ready = await waitForTunnelReady("https://x.trycloudflare.com", {
+      timeoutMs: 5_000,
+      intervalMs: 1,
+      fetchImpl
+    });
+    expect(ready).toBe(true);
+  });
+
+  it("warns and returns false when the edge never routes within the timeout", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchImpl = (async () => new Response("", { status: 502 })) as typeof fetch;
+    const ready = await waitForTunnelReady("https://x.trycloudflare.com", {
+      timeoutMs: 20,
+      intervalMs: 1,
+      fetchImpl
+    });
+    expect(ready).toBe(false);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
   });
 });
 

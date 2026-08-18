@@ -38,7 +38,6 @@ export class TwilioProvider implements TelephonyProvider {
       From: opts.from,
       Url: opts.answerUrl,
       StatusCallback: opts.statusCallbackUrl,
-      StatusCallbackEvent: "initiated ringing answered completed",
       Timeout: String(opts.timeoutSec),
       // Async answering-machine detection: the call connects immediately;
       // Twilio posts AnsweredBy to amdCallbackUrl once it has decided.
@@ -46,6 +45,13 @@ export class TwilioProvider implements TelephonyProvider {
       AsyncAmd: "true",
       AsyncAmdStatusCallback: opts.amdCallbackUrl
     });
+    // Twilio requires one StatusCallbackEvent field PER event (repeated form
+    // params, as twilio-node sends). A single space-separated value is
+    // rejected with error 21626 and NO status callbacks are ever delivered —
+    // observed live on 2026-08-18; every unanswered call wedged at "dialing".
+    for (const event of ["initiated", "ringing", "answered", "completed"]) {
+      body.append("StatusCallbackEvent", event);
+    }
 
     const data = await this.post<TwilioCallResponse>("/Calls.json", body);
     return { providerCallId: data.sid };

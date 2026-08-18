@@ -54,7 +54,14 @@ describe("TwilioProvider", () => {
       expect(body.get("From")).toBe(OPTS.from);
       expect(body.get("Url")).toBe(OPTS.answerUrl);
       expect(body.get("StatusCallback")).toBe(OPTS.statusCallbackUrl);
-      expect(body.get("StatusCallbackEvent")).toBe("initiated ringing answered completed");
+      // Repeated form fields, one per event — Twilio rejects a single
+      // space-separated value with error 21626 (no callbacks delivered).
+      expect(body.getAll("StatusCallbackEvent")).toEqual([
+        "initiated",
+        "ringing",
+        "answered",
+        "completed"
+      ]);
       expect(body.get("Timeout")).toBe("30");
       expect(body.get("MachineDetection")).toBe("DetectMessageEnd");
       expect(body.get("AsyncAmd")).toBe("true");

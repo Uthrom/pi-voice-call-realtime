@@ -559,15 +559,63 @@ export async function startServer(
  * so the fatal-error handler at the bottom of this file would print the
  * error and then hang forever instead of actually exiting.
  */
+/**
+ * Probe the public URL through the tunnel edge until OUR server answers.
+ * Fresh trycloudflare quick tunnels take several seconds to propagate; in
+ * that window the edge returns 502 (and WSS upgrades fail with Twilio error
+ * 31920) even though cloudflared has already printed the URL — observed live
+ * on 2026-08-18: a call placed ~45s after boot lost its answer-webhook
+ * media stream and its AMD callback to exactly this. Success = HTTP 404,
+ * the one status only our public handler returns for GET /voice/webhook
+ * (edge failures return 5xx; a signature-gated POST would be 403).
+ * On timeout we warn and continue — a static publicUrl behind a firewall
+ * that drops GETs must not brick startup.
+ */
+export async function waitForTunnelReady(
+  publicUrl: string,
+  opts?: { timeoutMs?: number; intervalMs?: number; fetchImpl?: typeof fetch }
+): Promise<boolean> {
+  const timeoutMs = opts?.timeoutMs ?? 30_000;
+  const intervalMs = opts?.intervalMs ?? 1_000;
+  const fetchFn = opts?.fetchImpl ?? fetch;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const res = await fetchFn(`${publicUrl}/voice/webhook`, {
+        method: "GET",
+        signal: AbortSignal.timeout(Math.min(intervalMs * 2, 5_000))
+      });
+      if (res.status === 404) return true;
+    } catch {
+      // Edge not routable yet (DNS, connect, or timeout) — keep polling.
+    }
+    if (Date.now() >= deadline) {
+      console.warn(
+        `[server] tunnel readiness probe timed out after ${timeoutMs}ms — ` +
+          `continuing, but ${publicUrl} may not be reachable from Twilio yet`
+      );
+      return false;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 export async function bootDaemon(
   cfg: Config,
-  spawnImpl?: Parameters<typeof resolvePublicUrl>[1]
+  spawnImpl?: Parameters<typeof resolvePublicUrl>[1],
+  opts?: { tunnelProbe?: Parameters<typeof waitForTunnelReady>[1] }
 ): Promise<{ handle: Awaited<ReturnType<typeof startServer>>; tunnel?: Tunnel; publicUrl: string }> {
   const { url: publicUrl, tunnel } = await resolvePublicUrl(cfg, spawnImpl);
   const runtimeCfg: Config = { ...cfg, serve: { ...cfg.serve, publicUrl } };
 
   try {
     const handle = await startServer(runtimeCfg);
+    // Only after the listeners are live: wait for the tunnel edge to route
+    // to us before declaring readiness, so the first call's webhooks don't
+    // land in the propagation window.
+    if (await waitForTunnelReady(publicUrl, opts?.tunnelProbe)) {
+      console.log(`[server] tunnel verified reachable at ${publicUrl}`);
+    }
     return { handle, tunnel, publicUrl };
   } catch (err) {
     await tunnel?.close().catch(() => {
