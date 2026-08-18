@@ -10,6 +10,7 @@ import type { TelephonyProvider } from "./manager.js";
 import { TwilioProvider } from "./providers/twilio.js";
 import { ReplayCache, publicUrlFor } from "./webhook-security.js";
 import { createPublicHandler } from "./webhook.js";
+import { createControlHandler } from "./control-api.js";
 import { MediaStreamConnection } from "./media-stream.js";
 import { RealtimeSession } from "./realtime.js";
 import { ManagedRealtimeSession } from "./managed-realtime.js";
@@ -213,14 +214,21 @@ export async function startServer(
     }
   });
 
-  // Task 13 mounts the full control API (initiate/status/transcript/end);
-  // for now, just the unauthenticated health check.
+  // The full localhost control API (initiate/status/transcript/end); see
+  // src/control-api.ts. `GET /health` is the only unauthenticated route.
+  const controlHandler = createControlHandler({ manager, store, config: cfg, publicUrl });
   const controlServer = createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/health") {
-      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true }));
-      return;
-    }
-    res.writeHead(404).end();
+    // Defensive backstop, mirroring the identical one on publicServer above:
+    // createControlHandler already catches internally and always resolves
+    // (never rejects), so this .catch() should be unreachable.
+    controlHandler(req, res).catch((err: unknown) => {
+      console.error("[server] unhandled control handler error:", err);
+      if (!res.headersSent) {
+        res.writeHead(500).end();
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
   });
   try {
     await listen(controlServer, cfg.serve.controlPort, "127.0.0.1");

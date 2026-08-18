@@ -391,12 +391,17 @@ describe("public webhook server", () => {
     expect(handle!.manager.getActive()?.status).toBe("dialing");
   });
 
-  it("control server responds to GET /health with {ok:true}", async () => {
+  it("control server responds to GET /health with {ok, activeCall, publicUrl} and no auth required", async () => {
     const { handle: h } = await boot();
     const port = (h.controlServer.address() as AddressInfo).port;
+    const publicPort = (h.publicServer.address() as AddressInfo).port;
     const res = await fetch(`http://127.0.0.1:${port}/health`);
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ ok: true });
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      activeCall: null,
+      publicUrl: `http://127.0.0.1:${publicPort}`
+    });
   });
 
   it(
