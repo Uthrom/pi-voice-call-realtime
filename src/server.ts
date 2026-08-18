@@ -618,7 +618,7 @@ function probeTunnelOnce(publicUrl: string, timeoutMs: number): Promise<number |
   return new Promise((resolve) => {
     let u: URL;
     try {
-      u = new URL(`${publicUrl}/voice/webhook`);
+      u = new URL(`${publicUrl}/voice/webhook?kind=status`);
     } catch {
       resolve(null);
       return;
@@ -652,7 +652,15 @@ function probeTunnelOnce(publicUrl: string, timeoutMs: number): Promise<number |
       });
     };
     const req = httpsRequest(
-      { hostname: u.hostname, port: u.port || 443, path: u.pathname, method: "GET", lookup, timeout: timeoutMs },
+      {
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", "content-length": "7" },
+        lookup,
+        timeout: timeoutMs
+      },
       (res) => {
         res.resume();
         resolve(res.statusCode ?? null);
@@ -663,7 +671,7 @@ function probeTunnelOnce(publicUrl: string, timeoutMs: number): Promise<number |
       resolve(null);
     });
     req.on("error", () => resolve(null));
-    req.end();
+    req.end("probe=1");
   });
 }
 
@@ -671,9 +679,12 @@ function probeTunnelOnce(publicUrl: string, timeoutMs: number): Promise<number |
  * Probe the public URL through the tunnel edge until OUR server answers.
  * Fresh trycloudflare quick tunnels take several seconds to propagate; in
  * that window the edge returns 502 even though cloudflared has already
- * printed the URL. Success = HTTP 404, the one status only our public
- * handler returns for GET /voice/webhook (edge failures return 5xx; a
- * signature-gated POST would be 403). On timeout we warn and continue —
+ * printed the URL. Success = HTTP 403 — the signature rejection only OUR
+ * handler produces for an unsigned POST. 404 explicitly does NOT count:
+ * Cloudflare's edge answers 404 for a trycloudflare hostname whose tunnel
+ * never registered (observed live 2026-08-18 — cloudflared printed a URL
+ * whose edge served 404 to every webhook, including Twilio's), so a 404
+ * "success" would verify a dead tunnel. On timeout we warn and continue —
  * a static publicUrl behind a firewall that drops GETs must not brick
  * startup, and (see probeTunnelOnce) a locally-unresolvable hostname can
  * still be reachable from Twilio.
@@ -690,8 +701,10 @@ export async function waitForTunnelReady(
     if (opts?.fetchImpl) {
       // Test seam: injected fetch stands in for the whole HTTPS+DNS stack.
       try {
-        const res = await opts.fetchImpl(`${publicUrl}/voice/webhook`, {
-          method: "GET",
+        const res = await opts.fetchImpl(`${publicUrl}/voice/webhook?kind=status`, {
+          method: "POST",
+          body: "probe=1",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
           signal: AbortSignal.timeout(Math.min(intervalMs * 2, 5_000))
         });
         status = res.status;
@@ -701,7 +714,7 @@ export async function waitForTunnelReady(
     } else {
       status = await probeTunnelOnce(publicUrl, Math.min(intervalMs * 2, 5_000));
     }
-    if (status === 404) return true;
+    if (status === 403) return true;
     if (Date.now() >= deadline) {
       console.warn(
         `[server] tunnel readiness probe timed out after ${timeoutMs}ms — ` +

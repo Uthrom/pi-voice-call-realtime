@@ -508,8 +508,8 @@ describe("startServer(...).closeControl()", () => {
 });
 
 describe("waitForTunnelReady", () => {
-  it("keeps polling through edge 502s and resolves true once our 404 appears", async () => {
-    const statuses = [502, 502, 404];
+  it("keeps polling through edge 502s (and dead-tunnel 404s) and resolves true once our 403 appears", async () => {
+    const statuses = [502, 404, 403];
     let calls = 0;
     const fetchImpl = (async () => new Response("", { status: statuses[calls++] ?? 404 })) as typeof fetch;
     const ready = await waitForTunnelReady("https://x.trycloudflare.com", {
@@ -526,7 +526,7 @@ describe("waitForTunnelReady", () => {
     const fetchImpl = (async () => {
       calls++;
       if (calls < 3) throw new Error("connect ECONNREFUSED");
-      return new Response("", { status: 404 });
+      return new Response("", { status: 403 });
     }) as typeof fetch;
     const ready = await waitForTunnelReady("https://x.trycloudflare.com", {
       timeoutMs: 5_000,
