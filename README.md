@@ -97,14 +97,19 @@ This starts the control API on `127.0.0.1:<controlPort>` (loopback only, bearer-
 
 ## Installing the pi extension
 
-The extension **must be installed by symlink**, not by copying the file. `extension/voice-call.ts` imports `@sinclair/typebox`, which it resolves via Node's module resolution walking up from the file's *real* path to find this repo's `node_modules`. A symlink preserves that real path; a plain copy into `~/.pi/agent/extensions/` would not resolve the import and would break at load time.
+Register the extension **by its absolute path** in `~/.pi/agent/settings.json` (add the `"extensions"` key alongside whatever is already there):
 
-```bash
-mkdir -p ~/.pi/agent/extensions
-ln -s "$(pwd)/extension/voice-call.ts" ~/.pi/agent/extensions/voice-call.ts
+```json
+{
+  "extensions": [
+    "/absolute/path/to/pi-voice-call-realtime/extension/voice-call.ts"
+  ]
+}
 ```
 
-Restart pi (or reload extensions) and it should pick up a `voice_call` tool and a `/call-status` command. Both read `~/.pi-voice/config.json` for the control-API token/port, so they only work once the daemon is running (see above).
+Do **not** symlink or copy the file into `~/.pi/agent/extensions/` — pi's loader resolves the extension's relative `./client.js` import against the file's apparent location, so a symlinked copy fails at startup with `Cannot find module './client.js'` (observed on pi 0.84.2). Registering the real path keeps both the relative import and the `@sinclair/typebox` import (resolved through this repo's `node_modules`, per pi's parent-`package.json` rule) working.
+
+Restart pi and it will pick up a `voice_call` tool and a `/call-status` command. Both read `~/.pi-voice/config.json` for the control-API token/port, so they only work once the daemon is running (see above). For a quick one-off test without touching settings, `pi -e /absolute/path/to/extension/voice-call.ts` works too.
 
 ## Smoke test
 
@@ -126,15 +131,15 @@ This is the manual acceptance test from the design spec's §9 testing section: i
 
 ## Known limitations / post-setup validation
 
-The pi extension (`extension/voice-call.ts`) was built against pi's published extension docs — `registerTool`/`registerCommand` shapes, the tool `execute` signature, TypeBox parameter schemas — but there was no local pi installation available during development to actually load it into. `extension/client.ts` — where all the logic lives — is unit-tested against a stubbed HTTP layer; `extension/voice-call.ts` is thin wiring that is type-checked but not unit-tested, and its integration with pi is docs-verified, not load-tested.
+The pi extension (`extension/voice-call.ts`) was built against pi's published extension docs. Its load path has been verified against a real pi installation (pi 0.84.2): registered via `settings.json`, the extension loads cleanly and `voice_call` appears in the agent's tool list. `extension/client.ts` — where all the logic lives — is unit-tested against a stubbed HTTP layer; `extension/voice-call.ts` is thin wiring that is type-checked and load-tested but not unit-tested, and a full call driven end-to-end through pi (rather than through `npm run call`) has not yet been exercised.
 
 First-run checklist:
-1. Symlink the extension (above) and start/restart pi.
+1. Register the extension in `settings.json` (above) and start/restart pi.
 2. Confirm a `voice_call` tool appears in pi's available tools, and `/call-status` appears as a command.
 3. Try `voice_call` with `action: "get_status"` against a running daemon (no call placed, safe/free) to confirm the extension can reach the control API at all.
 4. Only then run the billable smoke test above.
 
-If the extension fails to load or the tool's shape doesn't match what pi expects, please file an issue with the exact error — this is the one part of Phase 1 that most needs real-world confirmation.
+If the tool's runtime behavior doesn't match what pi expects, please file an issue with the exact error.
 
 ## Limits & safety defaults
 

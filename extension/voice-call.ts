@@ -19,15 +19,15 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-// Controller ruling: keep `@sinclair/typebox` (global-constraints.md
-// sanctions it as the one thing this extension may import from "pi's own
-// environment"). pi's own docs (https://pi.dev/docs/latest/extensions) also
-// schema tool parameters with "typebox". It resolves here because Task 16's
-// README mandates installing this extension by *symlinking*
-// extension/voice-call.ts into ~/.pi/agent/extensions/ — Node's module
-// resolution walks up from the symlink's real path (this repo) to find
-// node_modules, where the devDependency below actually lives. Installing by
-// plain copy instead of a symlink would break that resolution.
+// `@sinclair/typebox` resolves via this repo's node_modules: pi loads this
+// file from its real path (registered in ~/.pi/agent/settings.json under
+// "extensions"), and per pi's docs a package.json in a parent directory of
+// the extension makes its node_modules imports resolve automatically. Do NOT
+// install this extension by copying or symlinking the file elsewhere —
+// jiti resolves the relative `./client.js` import against the file's
+// apparent location, so a symlink in ~/.pi/agent/extensions/ fails with
+// "Cannot find module './client.js'" (observed on pi 0.84.2). Register the
+// absolute path in settings.json instead; see the README.
 import { Type, type Static } from "@sinclair/typebox";
 import { VoiceBridgeClient, type CallParamsInput } from "./client.js";
 
