@@ -62,16 +62,20 @@ type VoiceCallToolInput = Static<typeof voiceCallParams>;
 
 // Minimal structural shape of the pi extension API this file actually
 // touches, per https://pi.dev/docs/latest/extensions:
-// - `pi.registerTool({...})`, not `pi.tool(...)`.
+// - `pi.registerTool({...})`, not `pi.tool(...)`. The tool DEFINITION
+//   requires a `label` (the docs' worked example: `registerTool({name,
+//   label: "My Tool", description, ...})`) — that's distinct from the
+//   execute RETURN type, which the docs give as `{content, details?,
+//   isError?, usage?, terminate?}` with no label at all.
 // - A tool's `execute` is `(toolCallId, params, signal, onUpdate, ctx)` —
-//   params is the SECOND argument, not the first.
+//   params is the SECOND argument, not the first. `signal`/`onUpdate` are
+//   optional per the docs.
 // - `pi.registerCommand(name, {...})`, not `pi.command(...)`; a command's
 //   `handler` returns void and produces output via `ctx.ui.notify(...)`, not
-//   via a return value.
+//   via a return value. Notify levels per the docs: info/success/warning/error.
 interface PiToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
-  label?: string;
 }
 
 interface PiToolExecuteContext {
@@ -82,20 +86,21 @@ interface PiToolExecuteContext {
 
 interface PiCommandContext {
   ui: {
-    notify(text: string, level?: "info" | "warn" | "error"): void;
+    notify(text: string, level?: "info" | "success" | "warning" | "error"): void;
   };
 }
 
 interface PiExtensionApi {
   registerTool(def: {
     name: string;
+    label: string;
     description: string;
     parameters: typeof voiceCallParams;
     execute: (
       toolCallId: string,
       params: VoiceCallToolInput,
-      signal: AbortSignal,
-      onUpdate: (update: unknown) => void,
+      signal: AbortSignal | undefined,
+      onUpdate: ((update: unknown) => void) | undefined,
       ctx: PiToolExecuteContext
     ) => Promise<PiToolResult>;
   }): void;
@@ -206,6 +211,7 @@ async function runVoiceCallAction(client: VoiceBridgeClient, input: VoiceCallToo
 export default function registerVoiceCallExtension(pi: PiExtensionApi): void {
   pi.registerTool({
     name: "voice_call",
+    label: "Voice Call",
     description:
       "Place and manage outbound phone calls through the local voice-bridge daemon. " +
       "initiate_call blocks until the call completes and returns its outcome.",
@@ -214,9 +220,14 @@ export default function registerVoiceCallExtension(pi: PiExtensionApi): void {
       try {
         const client = clientFromConfig();
         const text = await runVoiceCallAction(client, params);
-        return { content: [{ type: "text", text }], label: params.action };
+        return { content: [{ type: "text", text }] };
       } catch (err) {
-        return { content: [{ type: "text", text: errorMessage(err) }], isError: true, label: params.action };
+        // Optional-chained, not a direct `params.action` dereference: params
+        // is pi-supplied input, not shaped by this file, so the error
+        // handler itself must never throw even if params turns out
+        // malformed at runtime despite the static VoiceCallToolInput type.
+        const action = params?.action ?? "voice_call";
+        return { content: [{ type: "text", text: `${action} failed: ${errorMessage(err)}` }], isError: true };
       }
     }
   });
