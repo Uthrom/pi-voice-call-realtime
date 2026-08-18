@@ -64,7 +64,19 @@ export async function startServer(
   });
 
   publicServer.on("request", (req, res) => {
-    void handler(req, res);
+    // Defensive backstop: createPublicHandler already catches internally
+    // and always resolves (never rejects), so this .catch() should be
+    // unreachable. It exists so a future change to webhook.ts can never
+    // crash the only public listener via an unhandled promise rejection —
+    // the same failure mode this fixes for the handler itself.
+    handler(req, res).catch((err: unknown) => {
+      console.error("[server] unhandled public handler error:", err);
+      if (!res.headersSent) {
+        res.writeHead(500).end();
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
   });
 
   // Task 13 mounts the full control API (initiate/status/transcript/end);
@@ -76,7 +88,22 @@ export async function startServer(
     }
     res.writeHead(404).end();
   });
-  await listen(controlServer, cfg.serve.controlPort, "127.0.0.1");
+  try {
+    await listen(controlServer, cfg.serve.controlPort, "127.0.0.1");
+  } catch (err) {
+    // The public listener is already live at this point (bound and
+    // serving webhooks) — if the control port fails to bind (e.g.
+    // EADDRINUSE from a second daemon instance), leaving it running would
+    // orphan a live, unclosable public listener with a wired CallManager.
+    // Close it before propagating the failure so a caller that catches
+    // startServer's rejection isn't left with a leaked listener they have
+    // no handle to.
+    await closeServer(publicServer).catch(() => {
+      // Best-effort: publicServer is already being torn down; a failure
+      // here must not mask the real error below.
+    });
+    throw err;
+  }
 
   return {
     manager,
@@ -93,6 +120,14 @@ function listen(server: Server, port: number, host?: string): Promise<void> {
     server.once("error", reject);
     const onListening = (): void => {
       server.removeListener("error", reject);
+      // Node's EventEmitter special-cases "error": emitting it with no
+      // listener attached throws, crashing the process. Once bound, the
+      // one-shot `reject` listener above is gone — without a replacement,
+      // a later runtime error (e.g. EMFILE accepting a new connection)
+      // would have nothing listening and take the process down with it.
+      server.on("error", (err) => {
+        console.error(`[server] listener error on port ${port}:`, err);
+      });
       resolve();
     };
     if (host !== undefined) {

@@ -28,68 +28,84 @@ export function createPublicHandler(deps: {
   const { manager, authToken, publicUrl, replay } = deps;
 
   return async function handlePublicRequest(req, res) {
-    const requestUrl = new URL(req.url ?? "/", "http://internal");
-    const kind = requestUrl.searchParams.get("kind");
-
-    if (
-      req.method !== "POST" ||
-      requestUrl.pathname !== WEBHOOK_PATH ||
-      (kind !== "answer" && kind !== "status" && kind !== "amd")
-    ) {
-      send(res, 404);
-      return;
-    }
-
-    let rawBody: string;
     try {
-      rawBody = await readBodyWithLimit(req, MAX_BODY_BYTES);
-    } catch {
-      send(res, 413);
-      return;
-    }
+      const requestUrl = new URL(req.url ?? "/", "http://internal");
+      const kind = requestUrl.searchParams.get("kind");
 
-    const params = Object.fromEntries(new URLSearchParams(rawBody));
-    const signature = firstHeader(req.headers["x-twilio-signature"]);
-    // The exact URL Twilio computed its signature against: the full public
-    // URL it POSTed to, including the `?kind=...` query string — the same
-    // answer/status/amd URLs server.ts handed Twilio at call-creation time.
-    const signedUrl = publicUrlFor(publicUrl(), req.url ?? WEBHOOK_PATH);
+      if (
+        req.method !== "POST" ||
+        requestUrl.pathname !== WEBHOOK_PATH ||
+        (kind !== "answer" && kind !== "status" && kind !== "amd")
+      ) {
+        send(res, 404);
+        return;
+      }
 
-    if (!validateTwilioSignature({ authToken, signature, url: signedUrl, params })) {
-      // SECURITY ORDERING: reject before any other processing — in
-      // particular, before ReplayCache.seen() is ever called. seen()
-      // unconditionally inserts its key, so calling it here would let an
-      // unauthenticated caller grow/poison the replay cache at request
-      // rate. See webhook-security.ts's ReplayCache.seen() doc comment.
-      send(res, 403);
-      return;
-    }
+      let rawBody: string;
+      try {
+        rawBody = await readBodyWithLimit(req, MAX_BODY_BYTES);
+      } catch {
+        send(res, 413);
+        return;
+      }
 
-    // Replay dedup guards operations with side effects: kind=status and
-    // kind=amd both drive manager.handleProviderEvent, a state mutation.
-    // kind=answer is a pure, idempotent TwiML lookup with no side effect to
-    // protect — deduping it would risk swallowing a legitimate Twilio retry
-    // of the answer webhook into an empty 200 with no TwiML, which would
-    // break the call. So it's deliberately excluded here.
-    if (kind !== "answer") {
-      const replayKey = `${signature}:${params.CallSid ?? ""}:${params.CallStatus ?? ""}`;
-      if (replay.seen(replayKey)) {
+      const params = Object.fromEntries(new URLSearchParams(rawBody));
+      const signature = firstHeader(req.headers["x-twilio-signature"]);
+      // The exact URL Twilio computed its signature against: the full public
+      // URL it POSTed to, including the `?kind=...` query string — the same
+      // answer/status/amd URLs server.ts handed Twilio at call-creation time.
+      const signedUrl = publicUrlFor(publicUrl(), req.url ?? WEBHOOK_PATH);
+
+      if (!validateTwilioSignature({ authToken, signature, url: signedUrl, params })) {
+        // SECURITY ORDERING: reject before any other processing — in
+        // particular, before ReplayCache.seen() is ever called. seen()
+        // unconditionally inserts its key, so calling it here would let an
+        // unauthenticated caller grow/poison the replay cache at request
+        // rate. See webhook-security.ts's ReplayCache.seen() doc comment.
+        send(res, 403);
+        return;
+      }
+
+      // Replay dedup guards operations with side effects: kind=status and
+      // kind=amd both drive manager.handleProviderEvent, a state mutation.
+      // kind=answer is a pure, idempotent TwiML lookup with no side effect
+      // to protect — deduping it would risk swallowing a legitimate Twilio
+      // retry of the answer webhook into an empty 200 with no TwiML, which
+      // would break the call. So it's deliberately excluded here.
+      if (kind !== "answer") {
+        const replayKey = `${signature}:${params.CallSid ?? ""}:${params.CallStatus ?? ""}`;
+        if (replay.seen(replayKey)) {
+          send(res, 200);
+          return;
+        }
+      }
+
+      if (kind === "answer") {
+        respondAnswer(res, manager, publicUrl, params);
+        return;
+      }
+      if (kind === "status") {
+        await handleStatus(manager, params);
         send(res, 200);
         return;
       }
-    }
-
-    if (kind === "answer") {
-      respondAnswer(res, manager, publicUrl, params);
-      return;
-    }
-    if (kind === "status") {
-      await handleStatus(manager, params);
+      await handleAmd(manager, params);
       send(res, 200);
-      return;
+    } catch (err) {
+      // Ordinary disk I/O (ENOSPC, EACCES, a corrupt JSON record) can reject
+      // anywhere along manager.handleProviderEvent's await chain. Without
+      // this, the rejection would escape as an unhandled promise rejection:
+      // the response is never written (Twilio hangs until its own timeout,
+      // then retries) and Node's default unhandled-rejection policy tears
+      // down the process — killing the only public listener mid-call. No
+      // error detail is put on the wire.
+      console.error("[webhook] handler error:", err);
+      if (!res.headersSent) {
+        send(res, 500);
+      } else if (!res.writableEnded) {
+        res.end();
+      }
     }
-    await handleAmd(manager, params);
-    send(res, 200);
   };
 }
 

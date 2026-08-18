@@ -2,11 +2,52 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer as createNetServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import { startServer } from "../src/server.js";
 import type { Config } from "../src/config.js";
+import { CallStore } from "../src/store.js";
+import type { CallRecord } from "../src/types.js";
 import { MockProvider } from "../src/providers/mock.js";
 import { sign } from "./helpers.js";
+
+/** A CallStore whose save() rejects exactly once, on demand (via `armFailure()`), then behaves normally. */
+class FlakyStore extends CallStore {
+  private shouldFail = false;
+
+  armFailure(): void {
+    this.shouldFail = true;
+  }
+
+  override async save(rec: CallRecord): Promise<void> {
+    if (this.shouldFail) {
+      this.shouldFail = false;
+      throw new Error("simulated disk failure");
+    }
+    return super.save(rec);
+  }
+}
+
+/** Binds an ephemeral TCP port, reads it, and releases it — for picking a port number to reuse deterministically. */
+function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createNetServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const port = (probe.address() as AddressInfo).port;
+      probe.close((err) => (err ? reject(err) : resolve(port)));
+    });
+  });
+}
+
+/** Binds and holds a TCP port so it looks occupied to a subsequent listen() attempt. */
+function occupyPort(port: number): Promise<import("node:net").Server> {
+  return new Promise((resolve, reject) => {
+    const occupier = createNetServer();
+    occupier.once("error", reject);
+    occupier.listen(port, "127.0.0.1", () => resolve(occupier));
+  });
+}
 
 const AUTH_TOKEN = "test-auth-token";
 
@@ -356,5 +397,71 @@ describe("public webhook server", () => {
     const res = await fetch(`http://127.0.0.1:${port}/health`);
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ok: true });
+  });
+
+  it(
+    "a handler-path failure (store.save rejects) returns 500, does not crash the process, and a subsequent valid request still succeeds",
+    async () => {
+      const store = new FlakyStore(tempHome());
+      const provider = new MockProvider();
+      const h = await startServer(makeConfig(tempHome()), { store, provider });
+      handle = h;
+      const port = (h.publicServer.address() as AddressInfo).port;
+      const baseUrl = `http://127.0.0.1:${port}`;
+
+      const rec = await h.manager.initiateCall({
+        to: "+15551234567",
+        objective: "confirm appointment",
+        talkingPoints: ["confirm time"],
+        callerIdentity: "pi"
+      });
+
+      // Arm the failure only for the save() the webhook handler itself
+      // triggers, not the one initiateCall already made above.
+      store.armFailure();
+      const failing = await postSigned(
+        baseUrl,
+        "/voice/webhook?kind=status",
+        callParams({ CallSid: rec.providerCallId!, CallStatus: "ringing" })
+      );
+      expect(failing.status).toBe(500);
+
+      // The process/listener must still be alive and responsive — proven by
+      // a completely independent request succeeding right after (uses a
+      // different CallStatus so its replay-cache key can't collide with the
+      // failed attempt above).
+      const following = await postSigned(
+        baseUrl,
+        "/voice/webhook?kind=status",
+        callParams({ CallSid: rec.providerCallId!, CallStatus: "in-progress" })
+      );
+      expect(following.status).toBe(200);
+      expect(h.manager.getActive()?.status).toBe("answered");
+    },
+    10000
+  );
+
+  it("a control-server bind failure rejects startServer and releases the public port", async () => {
+    const occupied = await getFreePort();
+    const occupier = await occupyPort(occupied);
+    const publicPortNum = await getFreePort();
+
+    try {
+      const cfg = makeConfig(tempHome());
+      cfg.serve.controlPort = occupied;
+      cfg.serve.publicPort = publicPortNum;
+
+      await expect(startServer(cfg, { provider: new MockProvider() })).rejects.toThrow();
+
+      // The public listener must have been closed by the failed startServer
+      // call — proven by nothing answering there anymore. (A "rebind
+      // succeeds" check is NOT a reliable proxy for this on all platforms:
+      // Node's default SO_REUSEADDR lets a second listen() on the same
+      // port succeed on macOS even while the first listener is still
+      // alive, which would make that check pass despite a real leak.)
+      await expect(fetch(`http://127.0.0.1:${publicPortNum}/anything`)).rejects.toThrow();
+    } finally {
+      await new Promise<void>((resolve) => occupier.close(() => resolve()));
+    }
   });
 });
