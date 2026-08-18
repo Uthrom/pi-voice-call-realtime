@@ -75,7 +75,7 @@ The extension also registers a `/call-status` command for quick human checks.
 6. Audio bridges both directions (base64 μ-law passthrough). Daemon sends an initial `response.create` so the AI speaks first ("Hi, I'm calling on behalf of …").
 7. Barge-in: on `input_audio_buffer.speech_started` → `response.cancel` to OpenAI + `clear` event to Twilio.
 8. The model conducts the conversation; may call in-call tools (§4).
-9. Call ends (model calls `end_call` after goodbye + playout drain via Twilio `mark`; or callee hangs up; or duration cap). Daemon finalizes the transcript, generates a summary + outcome via one cheap LLM call (pi-ai `getModel(...)` with a small model), marks the record complete.
+9. Call ends (model calls `end_call` after goodbye + playout drain via Twilio `mark`; or callee hangs up; or duration cap). Daemon finalizes the transcript, generates a summary + outcome via one cheap LLM call (direct OpenAI chat-completions request with `fetch`, `summaryModel` from config — see §5), marks the record complete.
 10. Extension poll sees `completed`, returns the result object to the pi agent.
 
 ## 4. The voice actor (in-call model)
