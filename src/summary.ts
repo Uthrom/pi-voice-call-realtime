@@ -2,6 +2,9 @@ import type { CallOutcome } from "./types.js";
 
 const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
 const MAX_TRANSCRIPT_CHARS = 12_000;
+const HEAD_CHARS = 4_000;
+const TAIL_CHARS = 8_000;
+const ELISION_MARKER = "\n…[transcript truncated]…\n";
 
 // Exact wording per the task brief — a test asserts this literal string.
 const SYSTEM_PROMPT =
@@ -41,7 +44,7 @@ export async function summarizeCall(opts: SummarizeCallOpts): Promise<CallSummar
   const fetchFn = opts.fetchImpl ?? fetch;
 
   try {
-    const truncated = opts.transcript.slice(0, MAX_TRANSCRIPT_CHARS);
+    const truncated = truncateTranscript(opts.transcript);
     const userContent = buildUserContent(opts.objective, truncated, opts.notedOutcome);
 
     const res = await fetchFn(OPENAI_CHAT_COMPLETIONS_URL, {
@@ -83,6 +86,22 @@ export async function summarizeCall(opts: SummarizeCallOpts): Promise<CallSummar
       summary: `Summary unavailable: ${message}`
     };
   }
+}
+
+// Controller ruling (supersedes the brief's literal "truncated to 12,000
+// chars"): a plain head-only slice discards exactly where a call's outcome
+// tends to live — its closing turns ("yes, Tuesday works") — which is
+// reachable on any max-duration call (~900s lands right around this
+// budget). Keep a 4,000-char head + an elision marker + the last 8,000
+// chars, within the same 12,000-char budget. Transcripts already at or
+// under the budget are left completely untouched.
+function truncateTranscript(transcript: string): string {
+  if (transcript.length <= MAX_TRANSCRIPT_CHARS) {
+    return transcript;
+  }
+  const head = transcript.slice(0, HEAD_CHARS);
+  const tail = transcript.slice(-TAIL_CHARS);
+  return `${head}${ELISION_MARKER}${tail}`;
 }
 
 function buildUserContent(objective: string, transcript: string, notedOutcome?: CallOutcome): string {

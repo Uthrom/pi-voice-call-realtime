@@ -70,9 +70,25 @@ describe("summarizeCall", () => {
     expect(body.messages[1].content).toContain("assistant: Hi");
   });
 
-  it("truncates the transcript to 12,000 chars before sending", async () => {
+  // Controller ruling (supersedes the brief's literal "truncated to
+  // 12,000 chars"): a plain head-slice discards exactly where a call's
+  // outcome tends to live — its closing turns. Truncation must keep a
+  // 4,000-char head, an elision marker, and the last 8,000 chars of the
+  // transcript, within the same 12,000-char budget.
+  it("truncates a long transcript to a 4,000-char head + elision marker + 8,000-char tail, preserving the closing turns where the outcome lives", async () => {
     const { fetchImpl, requests } = fakeFetch([{ status: 200, body: chatCompletionBody("ok", "fine") }]);
-    const longTranscript = "x".repeat(20_000);
+
+    const headMarker = "HEAD-MARKER-OPENING-TURNS";
+    const tailMarker = "TAIL-MARKER-CLOSING-TURNS-YES-TUESDAY-WORKS";
+    const middleFiller = "MIDDLE-FILLER-SHOULD-BE-DROPPED";
+    // Constructed so the implementation's exact slice boundaries
+    // (`transcript.slice(0, 4000)` / `transcript.slice(-8000)`) line up
+    // precisely with these marker placements — no ambiguity about whether a
+    // marker landed inside or outside the kept region.
+    const head = headMarker + "a".repeat(4_000 - headMarker.length);
+    const middle = "m".repeat(6_000) + middleFiller + "m".repeat(6_000);
+    const tail = "z".repeat(8_000 - tailMarker.length) + tailMarker;
+    const longTranscript = head + middle + tail;
 
     await summarizeCall({
       apiKey: "sk-test-key",
@@ -84,8 +100,33 @@ describe("summarizeCall", () => {
 
     const body = JSON.parse(requests[0]!.init.body as string);
     const userContent = body.messages[1].content as string;
-    expect(userContent).toContain("x".repeat(12_000));
-    expect(userContent).not.toContain("x".repeat(12_001));
+    const marker = "\n…[transcript truncated]…\n";
+    const transcriptSection = userContent.slice(userContent.indexOf("Transcript:\n") + "Transcript:\n".length);
+
+    expect(transcriptSection).toContain(headMarker);
+    expect(transcriptSection).toContain(tailMarker);
+    expect(transcriptSection).toContain(marker);
+    expect(transcriptSection).not.toContain(middleFiller);
+    expect(transcriptSection.length).toBeLessThanOrEqual(12_000 + marker.length);
+  });
+
+  it("leaves a transcript at or under 12,000 chars completely untouched (no elision marker introduced)", async () => {
+    const { fetchImpl, requests } = fakeFetch([{ status: 200, body: chatCompletionBody("ok", "fine") }]);
+    const shortTranscript = "assistant: Hi\ncaller: Yes, Tuesday works.\n" + "y".repeat(11_900);
+
+    await summarizeCall({
+      apiKey: "sk-test-key",
+      model: "gpt-4o-mini",
+      objective: "test",
+      transcript: shortTranscript,
+      fetchImpl
+    });
+
+    const body = JSON.parse(requests[0]!.init.body as string);
+    const userContent = body.messages[1].content as string;
+
+    expect(userContent).toContain(shortTranscript);
+    expect(userContent).not.toContain("transcript truncated");
   });
 
   it("includes notedOutcome in the prompt when present", async () => {
