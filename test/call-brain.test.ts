@@ -75,6 +75,49 @@ describe("buildInstructions", () => {
     expect(text).toContain("end_call");
   });
 
+  it("voicemail variant explicitly instructs not to wait for a reply (no one will respond under server VAD)", () => {
+    const text = buildInstructions(baseParams, { voicemail: true }).toLowerCase();
+    expect(text).toMatch(/nobody will respond|do not (pause|wait)/);
+  });
+
+  it("voicemail variant omits the interactive disinterest rule (there is no person to be uninterested)", () => {
+    const text = buildInstructions(baseParams, { voicemail: true });
+    expect(text.toLowerCase()).not.toContain("uninterested");
+  });
+
+  it("voicemail variant omits the AI-disclosure-if-asked rule (nobody is there to ask)", () => {
+    const text = buildInstructions(baseParams, { voicemail: true }).toLowerCase();
+    expect(text).not.toContain("if asked directly");
+  });
+
+  it("voicemail variant omits the note_outcome-then-goodbye interactive-resolution rule", () => {
+    const text = buildInstructions(baseParams, { voicemail: true });
+    expect(text).not.toContain("note_outcome");
+  });
+
+  it("voicemail variant does not open with a second-person 'you have reached voicemail' greeting", () => {
+    const text = buildInstructions(baseParams, { voicemail: true });
+    expect(text).not.toContain("You have reached voicemail");
+  });
+
+  it.each([
+    ["default", undefined] as const,
+    ["voicemail", { voicemail: true }] as const
+  ])("orders sections role < objective < talking points < behavior rules < closing (%s variant)", (_label, opts) => {
+    const text = buildInstructions(baseParams, opts);
+    const roleIdx = text.indexOf("You are a voice assistant");
+    const objectiveIdx = text.indexOf(baseParams.objective);
+    const talkingPointIdx = text.indexOf(`1. ${baseParams.talkingPoints[0]}`);
+    const rulesIdx = text.indexOf("Behavior rules:");
+    const closingIdx = text.indexOf(opts?.voicemail ? "Voicemail:" : "Conversation:");
+
+    expect(roleIdx).toBeGreaterThanOrEqual(0);
+    expect(objectiveIdx).toBeGreaterThan(roleIdx);
+    expect(talkingPointIdx).toBeGreaterThan(objectiveIdx);
+    expect(rulesIdx).toBeGreaterThan(talkingPointIdx);
+    expect(closingIdx).toBeGreaterThan(rulesIdx);
+  });
+
   it("never contains a secret pulled from process.env, even if one happens to be set", () => {
     const SECRET = "sk-test-SECRETVALUE-should-never-leak-9f8e7d6c";
     const prev = process.env.OPENAI_API_KEY;
@@ -147,6 +190,13 @@ describe("inCallTools", () => {
       expect(typeof tool.description).toBe("string");
       expect(tool.description.length).toBeGreaterThan(0);
     }
+  });
+
+  it("send_dtmf's digits parameter carries a DTMF-charset pattern hint", () => {
+    const sendDtmf = inCallTools().find((t) => t.name === "send_dtmf");
+    expect(sendDtmf).toBeDefined();
+    const params = sendDtmf!.parameters as { properties: { digits: { pattern?: string } } };
+    expect(params.properties.digits.pattern).toBe("^[0-9A-Da-d*#]+$");
   });
 });
 
@@ -232,5 +282,46 @@ describe("handleToolCall", () => {
     const result = await handleToolCall({ name: "note_outcome", callId: "call_7", args: {} }, actions);
     expect(result.output.toLowerCase()).toContain("error");
     expect(actions.noteOutcome).not.toHaveBeenCalled();
+  });
+
+  it("send_dtmf: a plausible model input that makes the wiring layer's DTMF generator throw is caught, not thrown", async () => {
+    const actions = makeActions();
+    // Mirrors src/dtmf.ts's generateDtmfMulaw, which throws on any
+    // character outside its key table — a typeof-only guard lets a string
+    // like "press 1" straight through to the real action.
+    actions.sendDtmf.mockImplementation(() => {
+      throw new Error("Invalid DTMF key: P");
+    });
+    const result = await handleToolCall(
+      { name: "send_dtmf", callId: "call_8", args: { digits: "press 1" } },
+      actions
+    );
+    expect(actions.sendDtmf).toHaveBeenCalledWith("press 1");
+    expect(result.output.toLowerCase()).toContain("error");
+    expect(result.respond).toBe(true);
+  });
+
+  it("end_call: a rejecting actions.endCall is caught, not thrown", async () => {
+    const actions = makeActions();
+    actions.endCall.mockRejectedValue(new Error("provider hangup failed"));
+    const result = await handleToolCall(
+      { name: "end_call", callId: "call_9", args: { reason: "objective-complete" } },
+      actions
+    );
+    expect(result.output.toLowerCase()).toContain("error");
+    expect(result.respond).toBe(true);
+  });
+
+  it("note_outcome: a throwing actions.noteOutcome is caught, not thrown", async () => {
+    const actions = makeActions();
+    actions.noteOutcome.mockImplementation(() => {
+      throw new Error("store write failed");
+    });
+    const result = await handleToolCall(
+      { name: "note_outcome", callId: "call_10", args: { outcome: "confirmed" } },
+      actions
+    );
+    expect(result.output.toLowerCase()).toContain("error");
+    expect(result.respond).toBe(true);
   });
 });

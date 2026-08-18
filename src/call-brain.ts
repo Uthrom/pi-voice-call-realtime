@@ -36,20 +36,33 @@ export function buildInstructions(params: CallParams, opts?: { voicemail?: boole
   lines.push("");
   lines.push("Behavior rules:");
   lines.push("- Speak in concise, natural spoken sentences.");
-  lines.push("- If asked directly whether you are an AI, disclose that you are an AI assistant.");
   lines.push("- Never invent commitments beyond the stated objective.");
-  lines.push(
-    "- If the person is uninterested or asks you to stop, wrap up politely and call end_call."
-  );
-  lines.push(
-    "- When the objective is resolved, call note_outcome immediately, then say goodbye and call end_call."
-  );
+  // The next three rules all presuppose a live back-and-forth (being asked
+  // a question, the other party losing interest, a conversational moment
+  // where the objective resolves) — none of that applies to a one-way
+  // voicemail monologue, so they're omitted entirely for that variant
+  // rather than left in place to confuse the model. See task-10 review
+  // round 1, issue 2.
+  if (!voicemail) {
+    lines.push("- If asked directly whether you are an AI, disclose that you are an AI assistant.");
+    lines.push(
+      "- If the person is uninterested or asks you to stop, wrap up politely and call end_call."
+    );
+    lines.push(
+      "- When the objective is resolved, call note_outcome immediately, then say goodbye and call end_call."
+    );
+  }
   lines.push("");
 
   if (voicemail) {
     lines.push("Voicemail:");
+    // Third-person framing (not "You have reached voicemail" — that reads
+    // as the callee's own greeting and risks being spoken verbatim) plus an
+    // explicit no-wait instruction, since server-side VAD otherwise leaves
+    // the model waiting for a reply that will never come. See task-10
+    // review round 1, issue 2.
     lines.push(
-      `You have reached voicemail. Leave one concise voicemail message covering the objective and a callback name for ${params.callerIdentity}, then call end_call.`
+      `This call reached voicemail; nobody will respond. Do not pause or wait for a reply. Leave one concise voicemail message covering the objective, give ${params.callerIdentity} as the callback name, then call end_call.`
     );
   } else {
     lines.push("Conversation:");
@@ -88,7 +101,8 @@ export function inCallTools(): RealtimeToolDef[] {
         properties: {
           digits: {
             type: "string",
-            description: "Digits to send, e.g. '1' or '1234#'."
+            description: "Digits to send, e.g. '1' or '1234#'.",
+            pattern: "^[0-9A-Da-d*#]+$"
           }
         },
         required: ["digits"]
@@ -125,8 +139,13 @@ export interface ToolActions {
 
 /**
  * Dispatch one realtime tool-call event to the corresponding action.
- * Never throws — malformed args or an unrecognized tool name produce an
- * error-shaped `output` string instead.
+ * Never throws — malformed args, an unrecognized tool name, or the
+ * dispatched action itself throwing/rejecting (e.g. `sendDtmf`'s
+ * `generateDtmfMulaw` throwing on a digit outside its DTMF key table, a
+ * provider hangup failing) all produce an error-shaped `output` string
+ * instead. This matters because the model is the only consumer of
+ * `output` — an uncaught throw here leaves it with no way to recover
+ * mid-call.
  */
 export async function handleToolCall(
   e: { name: string; callId: string; args: Record<string, unknown> },
@@ -138,7 +157,11 @@ export async function handleToolCall(
       if (typeof reason !== "string") {
         return { output: "error: missing or invalid required field 'reason'", respond: true };
       }
-      await actions.endCall(reason);
+      try {
+        await actions.endCall(reason);
+      } catch (err) {
+        return { output: `error: ${errorMessage(err)}`, respond: true };
+      }
       return { output: "call ending", respond: false };
     }
 
@@ -147,7 +170,11 @@ export async function handleToolCall(
       if (typeof digits !== "string") {
         return { output: "error: missing or invalid required field 'digits'", respond: true };
       }
-      actions.sendDtmf(digits);
+      try {
+        actions.sendDtmf(digits);
+      } catch (err) {
+        return { output: `error: ${errorMessage(err)}`, respond: true };
+      }
       return { output: "dtmf sent", respond: true };
     }
 
@@ -157,13 +184,23 @@ export async function handleToolCall(
         return { output: "error: missing or invalid required field 'outcome'", respond: true };
       }
       const details = e.args.details;
-      actions.noteOutcome(
-        typeof details === "string" ? { outcome, details } : { outcome }
-      );
+      try {
+        actions.noteOutcome(typeof details === "string" ? { outcome, details } : { outcome });
+      } catch (err) {
+        return { output: `error: ${errorMessage(err)}`, respond: true };
+      }
       return { output: "noted", respond: true };
     }
 
     default:
       return { output: `unknown tool: ${e.name}`, respond: true };
   }
+}
+
+// Only ever reads an Error's own `message` (or stringifies a non-Error
+// throw) — never anything wider — so an action's failure can't smuggle
+// anything beyond a plain diagnostic string into a model-facing tool
+// output.
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
