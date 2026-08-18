@@ -68,7 +68,12 @@ function spawnCloudflared(
   spawnImpl: typeof spawn
 ): Promise<{ url: string; tunnel: Tunnel }> {
   return new Promise((resolve, reject) => {
-    const proc = spawnImpl("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
+    // --protocol http2: the default QUIC transport is blocked or degraded on
+    // some networks, which manifests as intermittent edge 502s on webhooks
+    // and a hard 502 on EVERY WebSocket upgrade (Twilio error 31920 — the
+    // media stream never attaches and calls drop ~1s after answer). Observed
+    // live 2026-08-18; HTTP/2 transport avoids QUIC entirely.
+    const proc = spawnImpl("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`, "--protocol", "http2"], {
       stdio: ["ignore", "pipe", "pipe"]
     });
 

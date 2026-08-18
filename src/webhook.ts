@@ -136,7 +136,7 @@ function respondAnswer(
   const rec = active && callSid !== undefined && active.providerCallId === callSid ? active : undefined;
 
   const inner = rec
-    ? `<Connect><Stream url="${wsStreamUrl(publicUrl(), rec.streamToken)}"><Parameter name="token" value="${rec.streamToken}"/></Stream></Connect>`
+    ? `<Connect><Stream url="${wsStreamUrl(publicUrl())}"><Parameter name="token" value="${rec.streamToken}"/></Stream></Connect>`
     : "<Hangup/>";
 
   res.writeHead(200, { "content-type": "text/xml" }).end(`<?xml version="1.0" encoding="UTF-8"?>\n<Response>${inner}</Response>`);
@@ -174,18 +174,15 @@ async function handleAmd(manager: CallManager, params: Record<string, string>): 
   // else: e.g. "fax"/"unknown" — ignored.
 }
 
-// Twilio connects to <Stream url="..."> exactly as given, including any
-// query string, so the token travels as a `?token=` query param here — that
-// makes it available synchronously at WS-upgrade time (server.ts validates
-// it via manager.getByStreamToken before completing the handshake, so an
-// invalid token never gets as far as exchanging a single frame). The
-// <Parameter name="token"> element above carries the same value into
-// Twilio's `start` frame per Twilio's own custom-parameters convention;
-// MediaStreamConnection doesn't read it (only the query-string token is
-// actually consulted), but it's kept for wire-format completeness.
-function wsStreamUrl(base: string, token: string): string {
+// Twilio STRIPS query strings from the <Stream> URL (confirmed live
+// 2026-08-18 — every ?token= upgrade arrived tokenless, killing the media
+// stream on 100% of calls), so the URL is kept bare. The per-call auth
+// token travels ONLY via the <Parameter name="token"> element above, which
+// Twilio delivers in the `start` frame's customParameters; server.ts
+// completes the WS handshake first and validates the token from there.
+function wsStreamUrl(base: string): string {
   const host = new URL(base).host;
-  return `wss://${host}/voice/stream?token=${encodeURIComponent(token)}`;
+  return `wss://${host}/voice/stream`;
 }
 
 function readBodyWithLimit(req: IncomingMessage, maxBytes: number): Promise<string> {

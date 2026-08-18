@@ -99,7 +99,13 @@ describe("resolvePublicUrl", () => {
       expect(result.url).toBe("https://random-words-1234.trycloudflare.com");
       expect(result.tunnel?.url).toBe("https://random-words-1234.trycloudflare.com");
       expect(calls[0][0]).toBe("cloudflared");
-      expect(calls[0][1]).toEqual(["tunnel", "--url", "http://127.0.0.1:4321"]);
+      expect(calls[0][1]).toEqual([
+        "tunnel",
+        "--url",
+        "http://127.0.0.1:4321",
+        "--protocol",
+        "http2"
+      ]);
     });
 
     it("rejects with the captured output when the process exits before reporting a URL", async () => {

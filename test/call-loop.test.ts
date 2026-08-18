@@ -415,42 +415,96 @@ describe("call loop (mock integration)", () => {
     10_000
   );
 
-  it("a WS upgrade to /voice/stream with an unknown/invalid token is destroyed before any frame is exchanged", async () => {
+  it("a stream whose start frame carries an unknown token is closed and no session attaches", async () => {
     const home = tempHome();
     const provider = new MockProvider();
-    const h = await startServer(makeConfig(home), { provider });
+    const realtimeFactory = vi.fn(() => {
+      throw new Error("realtime session must never be constructed for an unauthenticated stream");
+    });
+    const h = await startServer(makeConfig(home), { provider, realtimeFactory });
     handle = h;
     const port = (h.publicServer.address() as AddressInfo).port;
 
     // A call exists (with its own valid token) so this isn't merely "no
     // active call at all" — the bad token must be rejected even though a
     // legitimate stream token is live.
-    await h.manager.initiateCall({
+    const rec = await h.manager.initiateCall({
       to: "+15551234567",
       objective: "confirm appointment",
       talkingPoints: ["confirm time"],
       callerIdentity: "pi"
     });
 
-    const client = new WebSocket(`ws://127.0.0.1:${port}/voice/stream?token=not-a-real-token`);
+    // No query token (Twilio strips query strings from <Stream> URLs) —
+    // the handshake must COMPLETE, then close after the start frame's
+    // customParameters token fails validation.
+    const client = new WebSocket(`ws://127.0.0.1:${port}/voice/stream`);
     wsClients.push(client);
 
-    let opened = false;
-    let gotMessage = false;
+    const closed = deferred<void>();
+    client.once("close", () => closed.resolve());
+    client.once("error", () => closed.resolve());
     client.on("open", () => {
-      opened = true;
+      client.send(
+        JSON.stringify({
+          event: "start",
+          start: { streamSid: "MZbogus", customParameters: { token: "not-a-real-token" } }
+        })
+      );
     });
-    client.on("message", () => {
-      gotMessage = true;
+    await withTimeout(closed.promise, 3000, undefined);
+
+    expect(realtimeFactory).not.toHaveBeenCalled();
+    // The legitimate call is untouched by the failed stream.
+    expect(h.manager.getActive()?.id).toBe(rec.id);
+  });
+
+  it("a stream authenticating via the start frame's customParameters token (Twilio's real path) attaches and completes the full loop", async () => {
+    const home = tempHome();
+    const provider = new MockProvider();
+    const { url: rtUrl } = await startScriptedRealtimeServer({
+      audioB64: Buffer.from([0xff, 0x7f, 0xff, 0x7f]).toString("base64"),
+      assistantTranscript: "Confirmed for 2pm tomorrow.",
+      outcome: "appointment-confirmed",
+      outcomeDetails: "2pm tomorrow confirmed",
+      endReason: "objective-complete"
+    });
+    const h = await startServer(makeConfig(home), {
+      provider,
+      realtimeFactory: (opts) => new RealtimeSession({ ...opts, urlOverride: rtUrl, connectTimeoutMs: 2000 })
+    });
+    handle = h;
+    const port = (h.publicServer.address() as AddressInfo).port;
+
+    const rec = await h.manager.initiateCall({
+      to: "+15551234567",
+      objective: "confirm appointment",
+      talkingPoints: ["confirm time"],
+      callerIdentity: "pi"
     });
 
-    const settled = deferred<void>();
-    client.once("error", () => settled.resolve());
-    client.once("close", () => settled.resolve());
-    await withTimeout(settled.promise, 2000, undefined);
+    // Bare URL, token only in the start frame — exactly what Twilio sends
+    // (query strings are stripped from <Stream> URLs on their side).
+    const client = await connectClient(`ws://127.0.0.1:${port}/voice/stream`);
+    wsClients.push(client);
+    client.on("message", (data: Buffer) => {
+      const frame = JSON.parse(data.toString()) as { event?: string; mark?: { name?: string } };
+      // Play Twilio's part: echo marks so the end_call playout drain resolves.
+      if (frame.event === "mark" && frame.mark?.name) {
+        client.send(JSON.stringify({ event: "mark", mark: { name: frame.mark.name } }));
+      }
+    });
+    client.send(
+      JSON.stringify({
+        event: "start",
+        start: { streamSid: "MZstartauth", customParameters: { token: rec.streamToken } }
+      })
+    );
 
-    expect(opened).toBe(false);
-    expect(gotMessage).toBe(false);
+    const store = new CallStore(home);
+    const final = await waitForFinalizedRecord(store, rec.id, 6000);
+    expect(final?.status).toBe("completed");
+    expect(final?.outcome?.outcome).toBe("appointment-confirmed");
   });
 
   it("AMD machine detected with amdPolicy 'hangup' ends the call without any media/realtime traffic", async () => {

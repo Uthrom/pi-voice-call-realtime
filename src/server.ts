@@ -163,6 +163,16 @@ export async function startServer(
   const drainTimeoutMs = overrides?.drainTimeoutMs ?? DRAIN_TIMEOUT_MS;
 
   const publicServer = createServer();
+  // cloudflared (and any reverse proxy) pools keep-alive connections to
+  // this origin. Node's default keepAliveTimeout is 5s — shorter than the
+  // proxy's pooling horizon — so the proxy routinely reuses a socket Node
+  // just closed, sees EOF, and surfaces a 502 to the caller (observed live
+  // 2026-08-18 as intermittent Twilio error 15003 on status callbacks).
+  // Keep the origin's idle window comfortably longer than the proxy's;
+  // headersTimeout must exceed keepAliveTimeout or in-flight headers on a
+  // reused socket can be cut off mid-read.
+  publicServer.keepAliveTimeout = 120_000;
+  publicServer.headersTimeout = 125_000;
   await listen(publicServer, cfg.serve.publicPort);
   const publicPort = (publicServer.address() as AddressInfo).port;
 
@@ -261,13 +271,18 @@ export async function startServer(
   // mirroring how the hangup branch doesn't need a session to act at all.
   let pendingVoicemailCallId: string | undefined;
 
+  // Pre-auth window: how long a completed-but-unauthenticated WS handshake
+  // may sit waiting for Twilio's `start` frame (which carries the token as
+  // a customParameter) before the socket is closed.
+  const STREAM_AUTH_TIMEOUT_MS = 10_000;
+
   publicServer.on("upgrade", (req, socket, head) => {
     let pathname: string;
-    let token: string | null;
+    let queryToken: string | null;
     try {
       const requestUrl = new URL(req.url ?? "/", "http://internal");
       pathname = requestUrl.pathname;
-      token = requestUrl.searchParams.get("token");
+      queryToken = requestUrl.searchParams.get("token");
     } catch {
       socket.destroy();
       return;
@@ -278,52 +293,77 @@ export async function startServer(
       return;
     }
 
-    const rec = token ? manager.getByStreamToken(token) : undefined;
-    if (!rec) {
-      socket.destroy();
-      return;
-    }
-
+    // Twilio STRIPS query strings from the <Stream> URL, so the token
+    // normally arrives only in the `start` frame's customParameters (from
+    // the TwiML <Parameter> element) — AFTER the WS handshake. Validating
+    // at upgrade time therefore destroyed every real Twilio stream
+    // (observed live 2026-08-18: Twilio error 31920 on every call; the
+    // origin EOF surfaced as an edge 502). The handshake is now completed
+    // first and the token validated from whichever channel delivers it:
+    // the query string when present (tests, local tooling), else the
+    // start frame, bounded by STREAM_AUTH_TIMEOUT_MS.
     wss.handleUpgrade(req, socket, head, (ws) => {
-      // Forwarding closures: MediaStreamConnection's handlers must be
-      // supplied at its own construction — necessarily before the
-      // CallSession that needs this MediaStreamConnection as one of its
-      // own deps can exist. `session` is assigned synchronously right
-      // after; these closures only ever run later, asynchronously, off the
-      // socket's own event loop, so it's always assigned by then.
-      let session: CallSession;
-      const media = new MediaStreamConnection(ws, {
-        onStart: () => {},
-        onAudio: (mulaw) => session.onCallerAudio(mulaw),
-        onStop: () => session.onMediaStop()
+      let session: CallSession | undefined;
+      let attached = false;
+
+      const authTimer = setTimeout(() => {
+        if (!attached) media.close();
+      }, STREAM_AUTH_TIMEOUT_MS);
+      authTimer.unref();
+
+      const media: MediaStreamConnection = new MediaStreamConnection(ws, {
+        onStart: (info) => {
+          if (attached) return;
+          const startToken = info.customParameters?.["token"] ?? queryToken ?? undefined;
+          const rec = startToken ? manager.getByStreamToken(startToken) : undefined;
+          if (!rec) {
+            media.close();
+            return;
+          }
+          attach(rec);
+        },
+        // Twilio sends media only after `start`; anything arriving on an
+        // unauthenticated socket is dropped by the optional chain.
+        onAudio: (mulaw) => session?.onCallerAudio(mulaw),
+        onStop: () => session?.onMediaStop()
       });
-      session = new CallSession({ record: rec, manager, media, realtimeFactory, config: cfg, summarize });
-      activeSession = session;
-      if (pendingVoicemailCallId === rec.id) {
-        // A machine+leave-message AMD event arrived before this stream
-        // connected — replay it now that a session finally exists. If the
-        // realtime socket isn't open yet either, switchToVoicemail() itself
-        // stashes it again (CallSession-level) and applies it once connect()
-        // succeeds.
-        pendingVoicemailCallId = undefined;
-        session.switchToVoicemail();
-      }
-      manager.markStreaming(rec.id).catch((err: unknown) => {
-        console.warn(`[server] markStreaming(${rec.id}) failed:`, err instanceof Error ? err.message : err);
-        // The record can never reach in-progress now — the duration-cap
-        // timer never arms, and this session would otherwise run
-        // uncapped. Treat it as a wedged call and tear it down rather than
-        // let it run forever.
-        session.abort();
-      });
-      const runPromise = session.run();
-      activeRun = runPromise;
-      runPromise
-        .catch((err: unknown) => console.error("[server] call session error:", err))
-        .finally(() => {
-          if (activeSession === session) activeSession = undefined;
-          if (activeRun === runPromise) activeRun = undefined;
+
+      function attach(rec: NonNullable<ReturnType<typeof manager.getByStreamToken>>): void {
+        attached = true;
+        clearTimeout(authTimer);
+        session = new CallSession({ record: rec, manager, media, realtimeFactory, config: cfg, summarize });
+        activeSession = session;
+        if (pendingVoicemailCallId === rec.id) {
+          // A machine+leave-message AMD event arrived before this stream
+          // connected — replay it now that a session finally exists. If the
+          // realtime socket isn't open yet either, switchToVoicemail() itself
+          // stashes it again (CallSession-level) and applies it once connect()
+          // succeeds.
+          pendingVoicemailCallId = undefined;
+          session.switchToVoicemail();
+        }
+        manager.markStreaming(rec.id).catch((err: unknown) => {
+          console.warn(`[server] markStreaming(${rec.id}) failed:`, err instanceof Error ? err.message : err);
+          // The record can never reach in-progress now — the duration-cap
+          // timer never arms, and this session would otherwise run
+          // uncapped. Treat it as a wedged call and tear it down rather than
+          // let it run forever.
+          session?.abort();
         });
+        const runPromise = session.run();
+        activeRun = runPromise;
+        runPromise
+          .catch((err: unknown) => console.error("[server] call session error:", err))
+          .finally(() => {
+            if (activeSession === session) activeSession = undefined;
+            if (activeRun === runPromise) activeRun = undefined;
+          });
+      }
+
+      // Fast path: a valid query token attaches immediately (kept for
+      // integration tests and local tooling — real Twilio never sends one).
+      const queryRec = queryToken ? manager.getByStreamToken(queryToken) : undefined;
+      if (queryRec) attach(queryRec);
     });
   });
 

@@ -17,7 +17,7 @@
 import type { WebSocket } from "ws";
 
 export interface MediaStreamHandlers {
-  onStart(info: { streamSid: string }): void;
+  onStart(info: { streamSid: string; customParameters?: Record<string, string> }): void;
   onAudio(mulaw: Buffer): void; // caller -> AI
   onStop(): void;
 }
@@ -27,7 +27,7 @@ export interface MediaStreamHandlers {
 // ignored).
 interface TwilioInboundFrame {
   event?: string;
-  start?: { streamSid?: string };
+  start?: { streamSid?: string; customParameters?: Record<string, string> };
   media?: { payload?: string };
   mark?: { name?: string };
 }
@@ -147,7 +147,16 @@ export class MediaStreamConnection {
       case "start":
         if (frame.start?.streamSid) {
           this._streamSid = frame.start.streamSid;
-          this.handlers.onStart({ streamSid: this._streamSid });
+          // Twilio delivers <Parameter> elements here as customParameters —
+          // the ONLY reliable channel for the per-call auth token, because
+          // Twilio strips query strings from the <Stream> URL (observed
+          // live 2026-08-18: every ?token= upgrade arrived tokenless).
+          this.handlers.onStart({
+            streamSid: this._streamSid,
+            ...(frame.start.customParameters
+              ? { customParameters: frame.start.customParameters }
+              : {})
+          });
         }
         break;
       case "media":
