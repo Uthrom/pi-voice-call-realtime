@@ -183,6 +183,11 @@ describe("RealtimeSession", () => {
         audio: {
           input: {
             format: { type: "audio/pcmu" },
+            // Ruled by task-9 review (supersedes the brief's literal JSON,
+            // which omitted this): without it the real API never emits
+            // conversation.item.input_audio_transcription.completed, so the
+            // caller-transcript branch would be unreachable in production.
+            transcription: { model: "gpt-4o-transcribe" },
             turn_detection: { type: "server_vad", threshold: 0.5, silence_duration_ms: 800 }
           },
           output: { format: { type: "audio/pcmu" }, voice: "verse" }
@@ -229,6 +234,97 @@ describe("RealtimeSession", () => {
       message = err instanceof Error ? err.message : String(err);
     }
     expect(message).not.toContain(TEST_API_KEY);
+  });
+
+  it("an error event replying to session.update (socket left open) rejects connect() promptly with a sanitized message", async () => {
+    const { server, url } = await startServer();
+    server.once("connection", (socket: WebSocket) => {
+      socket.on("message", (data: Buffer) => {
+        const msg = JSON.parse(data.toString()) as { type?: string };
+        if (msg.type === "session.update") {
+          // The real API's response to a rejected session.update: an
+          // `error` event, with the socket deliberately left open — no
+          // close, no transport-level error follows.
+          socket.send(
+            JSON.stringify({ type: "error", error: { code: "invalid_request", message: "bad session config" } })
+          );
+        }
+      });
+    });
+
+    const session = new RealtimeSession({
+      apiKey: TEST_API_KEY,
+      model: "gpt-realtime",
+      voice: "alloy",
+      instructions: "hi",
+      tools: [],
+      callbacks: NOOP_CALLBACKS,
+      urlOverride: url
+    });
+
+    const startedAt = Date.now();
+    const connectPromise = session.connect();
+    await expect(connectPromise).rejects.toThrow();
+    // Proves this settled off the error event itself, not the (10s
+    // default) ack timeout happening to also be short.
+    expect(Date.now() - startedAt).toBeLessThan(500);
+
+    let message = "";
+    try {
+      await connectPromise;
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain("invalid_request");
+    expect(message).not.toContain(TEST_API_KEY);
+  });
+
+  it("connect() rejects after the ack timeout when the server never sends session.updated (socket left open)", async () => {
+    const { server, url } = await startServer();
+    server.once("connection", () => {
+      // Deliberately never reply at all — no ack, no error, no close.
+    });
+
+    const session = new RealtimeSession({
+      apiKey: TEST_API_KEY,
+      model: "gpt-realtime",
+      voice: "alloy",
+      instructions: "hi",
+      tools: [],
+      callbacks: NOOP_CALLBACKS,
+      urlOverride: url,
+      connectTimeoutMs: 40
+    });
+
+    const startedAt = Date.now();
+    await expect(session.connect()).rejects.toThrow(/timed out/i);
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeGreaterThanOrEqual(35);
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it("a throwing onAudioDelta does not crash the session — a later event still dispatches", async () => {
+    let calls = 0;
+    const got = deferred<Buffer | undefined>();
+    const { socket } = await connectedSession({
+      onAudioDelta: (b) => {
+        calls++;
+        if (calls === 1) {
+          throw new Error("simulated callback failure");
+        }
+        got.resolve(b);
+      }
+    });
+
+    const audioBytes1 = Buffer.from([0x01]);
+    const audioBytes2 = Buffer.from([0x02, 0x03]);
+    socket.send(JSON.stringify({ type: "response.output_audio.delta", delta: audioBytes1.toString("base64") }));
+    socket.send(JSON.stringify({ type: "response.output_audio.delta", delta: audioBytes2.toString("base64") }));
+
+    const received = await withTimeout(got.promise, 300, undefined);
+    expect(Buffer.isBuffer(received)).toBe(true);
+    expect((received as Buffer).equals(audioBytes2)).toBe(true);
+    expect(calls).toBe(2);
   });
 
   it("appendAudio base64-frames the raw mu-law buffer with zero transcoding", async () => {
@@ -447,6 +543,50 @@ describe("ManagedRealtimeSession", () => {
     const msgPromise = nextClientMessage(socket);
     session.appendAudio(Buffer.from("abc"));
     expect(await msgPromise).toEqual({ type: "input_audio_buffer.append", audio: Buffer.from("abc").toString("base64") });
+
+    session.close();
+  });
+
+  it("a throwing outer onAudioDelta does not crash the managed session — a later event still dispatches", async () => {
+    const { server, url } = await startServer();
+    let socketRef: WebSocket | undefined;
+    server.once("connection", (socket: WebSocket) => {
+      startAutoAck(socket);
+      socketRef = socket;
+    });
+
+    let calls = 0;
+    const got = deferred<Buffer | undefined>();
+    const session = new ManagedRealtimeSession({
+      apiKey: TEST_API_KEY,
+      model: "gpt-realtime",
+      voice: "alloy",
+      instructions: "hi",
+      tools: [],
+      callbacks: {
+        ...NOOP_CALLBACKS,
+        onAudioDelta: (b) => {
+          calls++;
+          if (calls === 1) {
+            throw new Error("simulated callback failure");
+          }
+          got.resolve(b);
+        }
+      },
+      urlOverride: url
+    });
+    await session.connect();
+    const socket = socketRef!;
+
+    const audioBytes1 = Buffer.from([0x01]);
+    const audioBytes2 = Buffer.from([0x02, 0x03]);
+    socket.send(JSON.stringify({ type: "response.output_audio.delta", delta: audioBytes1.toString("base64") }));
+    socket.send(JSON.stringify({ type: "response.output_audio.delta", delta: audioBytes2.toString("base64") }));
+
+    const received = await withTimeout(got.promise, 300, undefined);
+    expect(Buffer.isBuffer(received)).toBe(true);
+    expect((received as Buffer).equals(audioBytes2)).toBe(true);
+    expect(calls).toBe(2);
 
     session.close();
   });

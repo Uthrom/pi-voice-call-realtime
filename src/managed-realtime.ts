@@ -83,21 +83,27 @@ export class ManagedRealtimeSession {
     this.maxSessionMs = opts.maxSessionMs ?? DEFAULT_MAX_SESSION_MS;
 
     const wrappedCallbacks: RealtimeCallbacks = {
+      // Each outer callback dispatch is wrapped defensively (see
+      // safeInvoke): Task 12's onAudioDelta writes to a Twilio socket and
+      // onToolCall dispatches into the pi SDK, either of which can throw.
+      // RealtimeSession's own dispatch is already exception-safe, but this
+      // wrapper doesn't rely on that — it protects itself regardless of
+      // what session implementation it's wrapping.
       onAudioDelta: (b) => {
         this.noteActivity();
-        this.outerCallbacks.onAudioDelta(b);
+        this.safeInvoke(() => this.outerCallbacks.onAudioDelta(b));
       },
       onSpeechStarted: () => {
         this.noteActivity();
-        this.outerCallbacks.onSpeechStarted();
+        this.safeInvoke(() => this.outerCallbacks.onSpeechStarted());
       },
       onTranscript: (e) => {
         this.noteActivity();
-        this.outerCallbacks.onTranscript(e);
+        this.safeInvoke(() => this.outerCallbacks.onTranscript(e));
       },
       onToolCall: (e) => {
         this.noteActivity();
-        this.outerCallbacks.onToolCall(e);
+        this.safeInvoke(() => this.outerCallbacks.onToolCall(e));
       },
       onClosed: (reason) => this.handleInnerClosed(reason)
     };
@@ -199,7 +205,7 @@ export class ManagedRealtimeSession {
 
     if (this.shuttingDown) {
       this.state = "closed";
-      this.outerCallbacks.onClosed(this.shutdownReason ?? reason);
+      this.safeInvoke(() => this.outerCallbacks.onClosed(this.shutdownReason ?? reason));
       return;
     }
 
@@ -209,8 +215,18 @@ export class ManagedRealtimeSession {
     this.reconnectAttempts = 0;
     void this.attemptConnect().catch(() => {
       this.state = "closed";
-      this.outerCallbacks.onClosed(reason);
+      this.safeInvoke(() => this.outerCallbacks.onClosed(reason));
     });
+  }
+
+  // Never let a throwing caller-supplied callback escape into internal
+  // dispatch code and crash the process (task-9 review issue 3).
+  private safeInvoke(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      console.warn("[managed-realtime] callback error:", err);
+    }
   }
 
   private shutdown(reason: string): void {

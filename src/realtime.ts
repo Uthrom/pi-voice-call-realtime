@@ -18,6 +18,14 @@
  * The API key is used only in the `Authorization` header of the outbound
  * connection — it is never included in the session config, logged, or
  * echoed into an error message.
+ *
+ * connect() cannot hang: it settles on session.updated, a pre-ack `error`
+ * event (socket left open — the real API's response to a rejected
+ * session.update), a socket error/close, or a bounded ack timeout,
+ * whichever comes first. Every callback dispatch is exception-safe — a
+ * throwing onAudioDelta/onToolCall/etc. (e.g. a dead Twilio socket, a pi
+ * SDK dispatch failure) is caught and warned, never left to crash the
+ * process.
  */
 
 import { WebSocket } from "ws";
@@ -45,14 +53,27 @@ interface RealtimeSessionOpts {
   tools: RealtimeToolDef[];
   callbacks: RealtimeCallbacks;
   urlOverride?: string;
+  // Testability hook — real callers never need this; default matches the
+  // reference's CONNECT_TIMEOUT_MS. Bounds how long connect() waits for
+  // session.updated before giving up, so a malformed session.update that
+  // the API silently ignores (no ack, no error, socket left open) can't
+  // hang connect() — and the caller — forever.
+  connectTimeoutMs?: number;
 }
 
 const DEFAULT_URL_BASE = "wss://api.openai.com/v1/realtime";
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
 // Fixed per the GA session config this bridge sends: server-side VAD only,
 // tuned for phone-call turn-taking (not configurable in this MVP).
 const VAD_THRESHOLD = 0.5;
 const VAD_SILENCE_DURATION_MS = 800;
+
+// Ruled by the task-9 review (supersedes the brief's literal session-config
+// JSON, which omitted this): without requesting input transcription, the
+// real API never emits conversation.item.input_audio_transcription.completed,
+// so the caller-transcript branch below would be unreachable in production.
+const INPUT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 
 /** Shape of an OpenAI Realtime event this module reads; other fields (and
  * other event types entirely) are ignored. */
@@ -61,6 +82,7 @@ interface RealtimeEvent {
   delta?: string;
   transcript?: string;
   item?: { type?: string; name?: string; call_id?: string; arguments?: string };
+  error?: { code?: string; message?: string };
 }
 
 export class RealtimeSession {
@@ -70,6 +92,7 @@ export class RealtimeSession {
   private readonly tools: RealtimeToolDef[];
   private readonly callbacks: RealtimeCallbacks;
   private readonly url: string;
+  private readonly connectTimeoutMs: number;
 
   // Mutated by updateInstructions(); re-sent as the session config on every
   // connect() so a caller-driven reconnect (ManagedRealtimeSession) doesn't
@@ -80,6 +103,15 @@ export class RealtimeSession {
   private ws: WebSocket | undefined;
   private _ended = false;
 
+  // The in-flight connect() promise's settlers, live only between connect()
+  // being called and it settling. handleEvent() reaches into these (via
+  // resolveConnect/rejectConnect) so a session.updated or a pre-ack error
+  // event — arriving through the same JSON message path as everything else
+  // — can settle connect() without duplicating event-parsing logic.
+  private connectResolve: (() => void) | undefined;
+  private connectReject: ((err: Error) => void) | undefined;
+  private connectTimer: NodeJS.Timeout | undefined;
+
   constructor(opts: RealtimeSessionOpts) {
     this.apiKey = opts.apiKey;
     this.model = opts.model;
@@ -88,6 +120,7 @@ export class RealtimeSession {
     this.tools = opts.tools;
     this.callbacks = opts.callbacks;
     this.url = opts.urlOverride ?? `${DEFAULT_URL_BASE}?model=${encodeURIComponent(opts.model)}`;
+    this.connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   }
 
   get ended(): boolean {
@@ -96,16 +129,26 @@ export class RealtimeSession {
 
   /** Opens the WebSocket, sends the session config, and resolves once the
    * API acknowledges it with `session.updated` — never on the socket merely
-   * opening. Rejects if the socket errors or closes first. */
+   * opening. Rejects if the socket errors or closes first, if the API
+   * responds with an `error` event instead of an ack (socket left open),
+   * or if session.updated never arrives within connectTimeoutMs. */
   async connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      let settled = false;
       this._ended = false;
+      this.connectResolve = resolve;
+      this.connectReject = reject;
 
       const ws = new WebSocket(this.url, {
         headers: { Authorization: `Bearer ${this.apiKey}` }
       });
       this.ws = ws;
+
+      this.connectTimer = setTimeout(() => {
+        this.rejectConnect(
+          new Error(`OpenAI Realtime connection timed out waiting for session.updated (${this.connectTimeoutMs}ms)`)
+        );
+      }, this.connectTimeoutMs);
+      this.connectTimer.unref?.();
 
       ws.on("open", () => {
         this.send({ type: "session.update", session: this.buildSessionConfig() });
@@ -120,32 +163,22 @@ export class RealtimeSession {
           // can carry caller speech content. Drop it silently.
           return;
         }
-        if (!settled && event.type === "session.updated") {
-          settled = true;
-          resolve();
-        }
-        this.handleEvent(event);
+        this.safeHandleEvent(event);
       });
 
       // A generic connection-level failure (DNS, TLS, refused handshake).
       // The close event that always follows is what actually settles
-      // rejection/onClosed bookkeeping, to avoid firing onClosed twice for
-      // one failure.
+      // onClosed bookkeeping, to avoid firing onClosed twice for one
+      // failure.
       ws.on("error", () => {
-        if (!settled) {
-          settled = true;
-          reject(new Error("OpenAI Realtime connection failed"));
-        }
+        this.rejectConnect(new Error("OpenAI Realtime connection failed"));
       });
 
       ws.on("close", (code: number, reasonBuf: Buffer) => {
         const reason = describeClose(code, reasonBuf);
-        if (!settled) {
-          settled = true;
-          reject(new Error(`OpenAI Realtime connection closed before session.updated (${reason})`));
-        }
+        this.rejectConnect(new Error(`OpenAI Realtime connection closed before session.updated (${reason})`));
         this._ended = true;
-        this.callbacks.onClosed(reason);
+        this.safeOnClosed(reason);
       });
     });
   }
@@ -198,6 +231,7 @@ export class RealtimeSession {
       audio: {
         input: {
           format: { type: "audio/pcmu" },
+          transcription: { model: INPUT_TRANSCRIPTION_MODEL },
           turn_detection: {
             type: "server_vad",
             threshold: VAD_THRESHOLD,
@@ -219,8 +253,48 @@ export class RealtimeSession {
     };
   }
 
+  // Wraps handleEvent so a throwing callback (onAudioDelta writing to a
+  // socket, onToolCall dispatching into the pi SDK, etc.) can never escape
+  // into the `ws` message emitter and crash the process — see task-9
+  // review issue 3. A caught throw is warned (never logs the raw event,
+  // which can carry caller speech content or a payload the API echoed).
+  private safeHandleEvent(event: RealtimeEvent): void {
+    try {
+      this.handleEvent(event);
+    } catch (err) {
+      console.warn("[realtime] callback error:", err);
+    }
+  }
+
+  private safeOnClosed(reason: string): void {
+    try {
+      this.callbacks.onClosed(reason);
+    } catch (err) {
+      console.warn("[realtime] onClosed callback error:", err);
+    }
+  }
+
   private handleEvent(event: RealtimeEvent): void {
     switch (event.type) {
+      case "session.updated":
+        this.resolveConnect();
+        break;
+
+      // The API responded to session.update with an error instead of an
+      // ack (socket stays open — no close/error transport event follows).
+      // Pre-ack, this is why connect() would otherwise hang: settle it
+      // with a sanitized message (only the API's own `code`/`message`
+      // fields, never the API key, which never appears in event payloads
+      // to begin with). Post-ack, OpenAI can emit non-fatal `error` events
+      // during a call (e.g. response.cancel with nothing active) — this
+      // session has no error-reporting callback to forward those to, so
+      // they're ignored.
+      case "error":
+        if (this.connectReject) {
+          this.rejectConnect(new Error(describeApiError(event)));
+        }
+        break;
+
       // GA name first, legacy (beta) name kept as a fallback alias.
       case "response.output_audio.delta":
       case "response.audio.delta":
@@ -260,6 +334,29 @@ export class RealtimeSession {
     }
   }
 
+  private resolveConnect(): void {
+    if (!this.connectResolve) return;
+    const resolve = this.connectResolve;
+    this.clearConnectSettlers();
+    resolve();
+  }
+
+  private rejectConnect(err: Error): void {
+    if (!this.connectReject) return;
+    const reject = this.connectReject;
+    this.clearConnectSettlers();
+    reject(err);
+  }
+
+  private clearConnectSettlers(): void {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = undefined;
+    }
+    this.connectResolve = undefined;
+    this.connectReject = undefined;
+  }
+
   private send(payload: unknown): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload));
@@ -281,4 +378,15 @@ function parseToolArgs(raw: string | undefined): Record<string, unknown> {
 function describeClose(code: number, reasonBuf: Buffer | undefined): string {
   const reasonText = reasonBuf && reasonBuf.length > 0 ? reasonBuf.toString() : "";
   return reasonText ? `${code}: ${reasonText}` : `${code}`;
+}
+
+// Only ever reads the API's own whitelisted `code`/`message` fields off an
+// `error` event — never the rest of the payload — so this can never echo
+// anything unexpected (and the API key never appears in event payloads to
+// begin with).
+function describeApiError(event: RealtimeEvent): string {
+  const code = event.error?.code;
+  const message = event.error?.message;
+  const detail = [code, message].filter((v): v is string => typeof v === "string" && v.length > 0).join(": ");
+  return detail ? `OpenAI Realtime API error (${detail})` : "OpenAI Realtime API error";
 }
