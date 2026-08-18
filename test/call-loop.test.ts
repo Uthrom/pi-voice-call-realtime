@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer as createNetServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, WebSocket } from "ws";
 import { startServer } from "../src/server.js";
@@ -228,6 +229,34 @@ async function startVoicemailScriptedServer(endReason: string): Promise<{
   });
 
   return { url, getSessionUpdates: () => sessionUpdates.slice() };
+}
+
+/** A minimal fake realtime server that just acks every session.update and
+ * otherwise does nothing — for tests that only need a genuinely OPEN,
+ * connected realtime session as scaffolding, with no further scripted
+ * behavior. */
+async function startAckOnlyRealtimeServer(): Promise<{ url: string }> {
+  const { server, url } = await new Promise<{ server: WebSocketServer; url: string }>((resolve) => {
+    const s = new WebSocketServer({ port: 0 }, () => {
+      const port = (s.address() as AddressInfo).port;
+      resolve({ server: s, url: `ws://127.0.0.1:${port}` });
+    });
+  });
+  fakeRealtimeServers.push(server);
+  server.on("connection", (socket: WebSocket) => {
+    socket.on("message", (data: Buffer) => {
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(data.toString()) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (msg.type === "session.update") {
+        socket.send(JSON.stringify({ type: "session.updated", session: {} }));
+      }
+    });
+  });
+  return { url };
 }
 
 // Stubs only the summarizer's own OpenAI call — everything else (in
@@ -466,6 +495,16 @@ describe("call loop (mock integration)", () => {
   // scripted cases, but exercising it directly closes an otherwise-untested
   // gap around a binding ruling.
   it("AMD machine detected with amdPolicy 'leave-message' switches the model to the voicemail prompt and defaults the outcome to voicemail-left", async () => {
+    // This test's assertions don't depend on the summarizer's output (the
+    // in-call voicemail-left default always wins), but teardown() still
+    // calls summarize() as part of finalizing — stub it so that doesn't
+    // fall through to a real network call to the OpenAI API in the
+    // background (a stray real fetch there doesn't fail *this* test, since
+    // nothing here awaits its outcome, but it can tie up Node's shared
+    // libuv thread pool — used for both DNS resolution and fs I/O — and
+    // slow down unrelated fs-heavy work in whichever test runs next).
+    stubSummaryFetch("n/a", "n/a");
+
     const { url: realtimeUrl, getSessionUpdates } = await startVoicemailScriptedServer("voicemail-delivered");
 
     const home = tempHome();
@@ -525,4 +564,303 @@ describe("call loop (mock integration)", () => {
       details: "answering machine detected; voicemail delivered"
     });
   }, 10_000);
+
+  // --- fix-round coverage (coordinator review findings 1-4) ---
+
+  it("close() resolves promptly even with a live media stream still open (client not pre-terminated)", async () => {
+    // close() now terminates the still-open media socket itself, which
+    // cascades into CallSession's teardown() (and its summarize() call) in
+    // the background after this test's own assertions are done — stub it
+    // to avoid a stray real network call; see the identical note on the
+    // AMD leave-message test above.
+    stubSummaryFetch("n/a", "n/a");
+
+    const { url: realtimeUrl } = await startAckOnlyRealtimeServer();
+
+    const home = tempHome();
+    const provider = new MockProvider();
+    const h = await startServer(makeConfig(home), {
+      provider,
+      realtimeFactory: (opts) => new RealtimeSession({ ...opts, urlOverride: realtimeUrl, connectTimeoutMs: 2000 })
+    });
+    // Deliberately NOT assigned to the shared `handle` — the shared
+    // afterEach terminates every tracked client before calling
+    // handle.close(), which would mask exactly the bug this test targets
+    // (an upgraded socket close() has to terminate itself). This test owns
+    // its own close() call instead.
+
+    const port = (h.publicServer.address() as AddressInfo).port;
+    const rec = await h.manager.initiateCall({
+      to: "+15551234567",
+      objective: "confirm appointment",
+      talkingPoints: ["confirm time"],
+      callerIdentity: "pi"
+    });
+
+    const client = await connectClient(`ws://127.0.0.1:${port}/voice/stream?token=${rec.streamToken}`);
+    sendFrame(client, { event: "start", start: { streamSid: "MZ_CLOSE_TEST" } });
+
+    // Give the realtime connect() + markStreaming a moment so the stream is
+    // genuinely live, not mid-setup.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(client.readyState).toBe(WebSocket.OPEN);
+
+    const result = await withTimeout(
+      h.close().then(() => "closed" as const),
+      3000,
+      "timed-out" as const
+    );
+    expect(result).toBe("closed");
+  });
+
+  it("a call torn down without note_outcome persists the summarizer's own derived outcome instead of none", async () => {
+    const fetchStub = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === "https://api.openai.com/v1/chat/completions") {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              { message: { content: JSON.stringify({ outcome: "no-answer-inferred", summary: "The caller did not respond." }) } }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchStub);
+
+    const { url: realtimeUrl } = await startAckOnlyRealtimeServer();
+    const home = tempHome();
+    const provider = new MockProvider();
+    const h = await startServer(makeConfig(home), {
+      provider,
+      realtimeFactory: (opts) => new RealtimeSession({ ...opts, urlOverride: realtimeUrl, connectTimeoutMs: 2000 })
+    });
+    handle = h;
+    const port = (h.publicServer.address() as AddressInfo).port;
+
+    const rec = await h.manager.initiateCall({
+      to: "+15551234567",
+      objective: "confirm appointment",
+      talkingPoints: ["confirm time"],
+      callerIdentity: "pi"
+    });
+
+    const client = await connectClient(`ws://127.0.0.1:${port}/voice/stream?token=${rec.streamToken}`);
+    sendFrame(client, { event: "start", start: { streamSid: "MZ_NO_NOTE" } });
+
+    // Let the realtime connect() settle, then simulate the caller/Twilio
+    // hanging up — no tool call (in particular no note_outcome) ever fires.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    client.close();
+
+    const store = new CallStore(home);
+    const finalRec = await waitForFinalizedRecord(store, rec.id);
+    expect(finalRec?.status).toBe("interrupted");
+    expect(finalRec?.outcome).toEqual({ outcome: "no-answer-inferred" });
+    expect(finalRec?.summary).toBe("The caller did not respond.");
+  });
+
+  it("AMD machine + leave-message arriving before the stream attaches is still applied once the session connects, and defaults the outcome to voicemail-left", async () => {
+    // Same reasoning as the other AMD leave-message test — stub summarize's
+    // fetch so teardown() can't fall through to a real network call.
+    stubSummaryFetch("n/a", "n/a");
+
+    const { url: realtimeUrl, getSessionUpdates } = await startVoicemailScriptedServer("voicemail-delivered");
+
+    const home = tempHome();
+    const provider = new MockProvider();
+    const h = await startServer(makeConfig(home), {
+      provider,
+      realtimeFactory: (opts) => new RealtimeSession({ ...opts, urlOverride: realtimeUrl, connectTimeoutMs: 2000 })
+    });
+    handle = h;
+    const port = (h.publicServer.address() as AddressInfo).port;
+
+    const rec = await h.manager.initiateCall({
+      to: "+15551234567",
+      objective: "confirm appointment",
+      talkingPoints: ["confirm time"],
+      callerIdentity: "pi",
+      amdPolicy: "leave-message"
+    });
+
+    // No media stream — and therefore no CallSession — exists yet.
+    await h.manager.handleProviderEvent(provider.amdEvent(rec.providerCallId!, "machine"));
+
+    const client = await connectClient(`ws://127.0.0.1:${port}/voice/stream?token=${rec.streamToken}`);
+    const closed = deferred<void>();
+    client.on("close", () => closed.resolve());
+    client.on("message", (data: Buffer) => {
+      const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+      if (frame.event === "mark") {
+        const markName = (frame.mark as { name: string }).name;
+        sendFrame(client, { event: "mark", mark: { name: markName } });
+      }
+    });
+    sendFrame(client, { event: "start", start: { streamSid: "MZ_PRE_STREAM" } });
+
+    await withTimeout(closed.promise, 4000, undefined);
+
+    const updates = getSessionUpdates();
+    // Two session.update messages: the initial (non-voicemail) config sent
+    // by connect() itself, then the voicemail swap applied right after
+    // connect() succeeds (the pending flag stashed by switchToVoicemail()
+    // both at the server level — no session existed yet — and again inside
+    // CallSession, since rt wasn't open at construction time either).
+    expect(updates.length).toBeGreaterThanOrEqual(2);
+    const lastUpdate = updates[updates.length - 1]?.session as { instructions?: string };
+    expect(lastUpdate.instructions).toContain("Voicemail:");
+
+    const store = new CallStore(home);
+    const finalRec = await waitForFinalizedRecord(store, rec.id);
+    expect(finalRec?.status).toBe("completed");
+    expect(finalRec?.endReason).toBe("voicemail-delivered");
+    expect(finalRec?.outcome).toEqual({
+      outcome: "voicemail-left",
+      details: "answering machine detected; voicemail delivered"
+    });
+  });
+
+  it(
+    "AMD leave-message arriving while the realtime socket has never opened does not falsely persist a voicemail-left outcome",
+    async () => {
+      // A raw TCP server that accepts the connection but never completes the
+      // WS upgrade handshake at all — unlike a real WebSocketServer (whose
+      // raw socket reaches OPEN the instant its handshake completes, which
+      // would make the "not open yet" window too short/racy to land a test
+      // on reliably), this keeps `RealtimeSession.isOpen` false for as long
+      // as the test needs. Mirrors the same pattern in
+      // test/realtime.test.ts's "ack-timeout teardown" regression test.
+      let serverSideSocket: import("node:net").Socket | undefined;
+      const rawServer = createNetServer((socket) => {
+        serverSideSocket = socket;
+        socket.on("error", () => {});
+      });
+      await new Promise<void>((resolve) => rawServer.listen(0, "127.0.0.1", () => resolve()));
+      const rawPort = (rawServer.address() as AddressInfo).port;
+      const realtimeUrl = `ws://127.0.0.1:${rawPort}`;
+
+      const fetchStub = vi.fn(async () => {
+        throw new Error("network disabled in test");
+      });
+      vi.stubGlobal("fetch", fetchStub);
+
+      const home = tempHome();
+      const provider = new MockProvider();
+      const h = await startServer(makeConfig(home), {
+        provider,
+        realtimeFactory: (opts) => new RealtimeSession({ ...opts, urlOverride: realtimeUrl, connectTimeoutMs: 200 })
+      });
+      handle = h;
+      const port = (h.publicServer.address() as AddressInfo).port;
+
+      const rec = await h.manager.initiateCall({
+        to: "+15551234567",
+        objective: "confirm appointment",
+        talkingPoints: ["confirm time"],
+        callerIdentity: "pi",
+        amdPolicy: "leave-message"
+      });
+
+      const client = await connectClient(`ws://127.0.0.1:${port}/voice/stream?token=${rec.streamToken}`);
+      sendFrame(client, { event: "start", start: { streamSid: "MZ_NEVER_OPEN" } });
+
+      // Fire AMD promptly, well before connectTimeoutMs elapses — the
+      // realtime socket is guaranteed still CONNECTING (never OPEN).
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await h.manager.handleProviderEvent(provider.amdEvent(rec.providerCallId!, "machine"));
+
+      const store = new CallStore(home);
+      const finalRec = await waitForFinalizedRecord(store, rec.id);
+      expect(finalRec?.status).toBe("interrupted");
+      expect(finalRec?.outcome?.outcome).not.toBe("voicemail-left");
+
+      serverSideSocket?.destroy();
+      await new Promise<void>((resolve) => rawServer.close(() => resolve()));
+    },
+    10_000
+  );
+
+  it("a markStreaming failure tears the session down (interrupted) instead of running uncapped, and does not crash the process", async () => {
+    class FlakyStore extends CallStore {
+      private shouldFail = false;
+      armFailure(): void {
+        this.shouldFail = true;
+      }
+      override async save(rec: CallRecord): Promise<void> {
+        if (this.shouldFail) {
+          this.shouldFail = false;
+          throw new Error("simulated disk failure");
+        }
+        return super.save(rec);
+      }
+    }
+
+    // Proves the fix doesn't merely rely on server.ts's own .catch() —
+    // captures any genuinely unhandled rejection process-wide, so a
+    // regression back to a bare `void manager.markStreaming(...)` (no
+    // .catch at all) is caught here even if it happened to be masked by
+    // some other coincidental path also reaching "interrupted".
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    try {
+      const fetchStub = vi.fn(async () => {
+        throw new Error("network disabled in test");
+      });
+      vi.stubGlobal("fetch", fetchStub);
+
+      // An ack-only realtime server that stays open for the whole test —
+      // deliberately NOT a never-acks/never-opens fake, so the realtime
+      // connect's own failure/timeout path can't also independently drive
+      // the record to "interrupted" and produce a false-positive pass. The
+      // only thing that can finalize this call within the test's bounded
+      // wait is markStreaming's failure path.
+      const { url: realtimeUrl } = await startAckOnlyRealtimeServer();
+
+      const home = tempHome();
+      const store = new FlakyStore(home);
+      const provider = new MockProvider();
+      const h = await startServer(makeConfig(home), {
+        store,
+        provider,
+        realtimeFactory: (opts) => new RealtimeSession({ ...opts, urlOverride: realtimeUrl, connectTimeoutMs: 5000 })
+      });
+      handle = h;
+      const port = (h.publicServer.address() as AddressInfo).port;
+
+      const rec = await h.manager.initiateCall({
+        to: "+15551234567",
+        objective: "confirm appointment",
+        talkingPoints: ["confirm time"],
+        callerIdentity: "pi"
+      });
+
+      // Arm the failure only for the save() markStreaming itself triggers,
+      // not the one initiateCall already made above.
+      store.armFailure();
+
+      const client = await connectClient(`ws://127.0.0.1:${port}/voice/stream?token=${rec.streamToken}`);
+      const closed = deferred<void>();
+      client.on("close", () => closed.resolve());
+
+      await withTimeout(closed.promise, 4000, undefined);
+      expect(client.readyState).toBe(WebSocket.CLOSED);
+
+      const finalRec = await waitForFinalizedRecord(store, rec.id);
+      expect(finalRec?.status).toBe("interrupted");
+
+      // Give a genuinely unhandled rejection a moment to surface before
+      // checking (Node schedules the event a tick or two after settling).
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
 });

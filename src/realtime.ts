@@ -130,6 +130,19 @@ export class RealtimeSession {
     return this._ended;
   }
 
+  /**
+   * True only once the socket is actually OPEN (post session.updated ack).
+   * `send()` below silently no-ops on any other readyState (CONNECTING, or
+   * gone during a reconnect gap) — callers that need to know whether a call
+   * like `updateInstructions()` actually reached the API, rather than
+   * having been dropped on the floor, should check this first (added for
+   * Task 12's AMD voicemail-switch, which must not claim a voicemail was
+   * delivered when the send silently did nothing).
+   */
+  get isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
   /** Opens the WebSocket, sends the session config, and resolves once the
    * API acknowledges it with `session.updated` — never on the socket merely
    * opening. Rejects if the socket errors or closes first, if the API

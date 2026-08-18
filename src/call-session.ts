@@ -40,11 +40,21 @@ export class CallSession {
   // this point a caller's trailing audio triggering VAD must not
   // cancel/clear the goodbye that's already playing out.
   private ending = false;
-  // Set when the AMD leave-message branch switches the model into the
-  // voicemail prompt variant — read by teardown (controller ruling 1) to
-  // default the outcome when the model, which structurally can't call
-  // note_outcome in that variant, never noted one.
+  // Set only once the voicemail prompt swap is actually delivered to an
+  // OPEN realtime socket (never when switchToVoicemail's send silently
+  // no-op'd) — read by teardown (controller ruling 1) to default the
+  // outcome when the model, which structurally can't call note_outcome in
+  // that variant, never noted one. A false positive here would persist
+  // "voicemail delivered" for a voicemail that was never actually spoken.
   private voicemailTriggered = false;
+  // True once AMD leave-message has been requested but the realtime socket
+  // wasn't OPEN yet to receive it (still connecting, or a reconnect gap —
+  // includes the case where no CallSession existed at all when AMD fired;
+  // server.ts stashes that case and replays it as switchToVoicemail() right
+  // after this session is constructed, which lands here too). Applied the
+  // moment the *initial* connect() succeeds; not re-checked on a later
+  // mid-call reconnect (out of scope — see task-12 fix-round report).
+  private pendingVoicemail = false;
   private teardownStarted = false;
   private finishRun: (() => void) | undefined;
 
@@ -110,14 +120,44 @@ export class CallSession {
   }
 
   /**
+   * External abort — used by server.ts when a step it owns outside this
+   * class's control fails in a way that leaves the call unable to proceed
+   * (e.g. manager.markStreaming() rejecting: the record can never reach
+   * in-progress, so the duration-cap timer never arms and this session
+   * would otherwise run uncapped). Tears the session down exactly like any
+   * other teardown trigger — idempotent, finalizes as "interrupted" if
+   * nothing else already finalized the record.
+   */
+  abort(): void {
+    void this.teardown();
+  }
+
+  /**
    * AMD machine + leave-message policy. Server.ts owns AMD routing (a
    * machine+hangup event can arrive before any media stream, and therefore
    * any CallSession, ever connects — see server.ts), and calls this once it
    * knows a leave-message policy applies and this session is the active
-   * one. Swaps the model into the voicemail prompt variant and kicks off
-   * the one-way message.
+   * one (server.ts replays a pre-stream AMD event through this same method
+   * right after constructing the session, so "no session yet" and "session
+   * exists but isn't connected yet" both funnel through the pending path
+   * below).
+   *
+   * If the realtime socket is OPEN, applies immediately. Otherwise — still
+   * connecting, or a reconnect gap — updateInstructions()/createResponse()
+   * would silently no-op (RealtimeSession.send() drops frames when the
+   * socket isn't OPEN), so this stashes the request instead of falsely
+   * marking it delivered; `start()` applies it once the initial connect()
+   * succeeds.
    */
   switchToVoicemail(): void {
+    if (this.rt?.isOpen) {
+      this.applyVoicemail();
+    } else {
+      this.pendingVoicemail = true;
+    }
+  }
+
+  private applyVoicemail(): void {
     this.voicemailTriggered = true;
     this.rt?.updateInstructions(buildInstructions(this.record.params, { voicemail: true }));
     this.rt?.createResponse();
@@ -167,6 +207,16 @@ export class CallSession {
     } catch (err) {
       console.warn("[call-session] realtime connect failed:", err instanceof Error ? err.message : String(err));
       await this.teardown();
+      return;
+    }
+
+    if (this.pendingVoicemail) {
+      // AMD leave-message arrived before this session had a live socket to
+      // apply it to (pre-stream, or during the initial connect) — apply it
+      // now instead of the normal greet-first response, which would
+      // otherwise race/duplicate it.
+      this.pendingVoicemail = false;
+      this.applyVoicemail();
       return;
     }
 
@@ -280,7 +330,18 @@ export class CallSession {
       const base = finalRecord ?? (await this.store.get(this.record.id)) ?? this.record;
       const updated: CallRecord = {
         ...base,
-        ...(this.record.outcome !== undefined ? { outcome: this.record.outcome } : {}),
+        // The in-call noted outcome (note_outcome, or ruling 1's
+        // voicemail-left default) always wins when present — it was set
+        // with full in-call context. Otherwise, fall back to the
+        // summarizer's own derived outcome rather than persisting no
+        // outcome at all: every call that ends without note_outcome ever
+        // firing (caller hangup, duration cap, an interrupted stream) would
+        // otherwise silently lose the outcome summarizeCall already
+        // computed (it always returns one — "unknown" is its own failure
+        // fallback, still an outcome). summarizeCall is passed
+        // this.record.outcome as notedOutcome above, so when that *is*
+        // present its own `outcome` field typically just echoes it back.
+        outcome: this.record.outcome ?? { outcome: summary.outcome },
         summary: summary.summary,
         ...(transcriptPath !== undefined ? { transcriptPath } : {})
       };

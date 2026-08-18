@@ -124,6 +124,14 @@ export class ManagedRealtimeSession {
     return this._ended;
   }
 
+  /** Delegates to the current inner session — correctly reflects "not open"
+   * during the initial connect, a mid-call reconnect gap, or after close(),
+   * regardless of what this wrapper's own (internal-bookkeeping) `state`
+   * currently reads. See RealtimeSession.isOpen's doc comment. */
+  get isOpen(): boolean {
+    return this.inner.isOpen;
+  }
+
   async connect(): Promise<void> {
     this.shuttingDown = false;
     this.reconnectAttempts = 0;

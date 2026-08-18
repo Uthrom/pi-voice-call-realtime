@@ -115,6 +115,13 @@ export async function startServer(
   // used only to route the AMD leave-message branch (below) to a live
   // realtime session.
   let activeSession: CallSession | undefined;
+  // AMD leave-message can arrive before any media stream — and therefore
+  // any CallSession — has connected at all (Twilio's AMD callback and the
+  // <Connect><Stream> negotiation race independently). Stashes that call's
+  // id so the upgrade handler below can replay it through
+  // CallSession.switchToVoicemail() the moment the session is constructed,
+  // mirroring how the hangup branch doesn't need a session to act at all.
+  let pendingVoicemailCallId: string | undefined;
 
   publicServer.on("upgrade", (req, socket, head) => {
     let pathname: string;
@@ -154,7 +161,23 @@ export async function startServer(
       });
       session = new CallSession({ record: rec, manager, media, realtimeFactory, config: cfg, summarize });
       activeSession = session;
-      void manager.markStreaming(rec.id);
+      if (pendingVoicemailCallId === rec.id) {
+        // A machine+leave-message AMD event arrived before this stream
+        // connected — replay it now that a session finally exists. If the
+        // realtime socket isn't open yet either, switchToVoicemail() itself
+        // stashes it again (CallSession-level) and applies it once connect()
+        // succeeds.
+        pendingVoicemailCallId = undefined;
+        session.switchToVoicemail();
+      }
+      manager.markStreaming(rec.id).catch((err: unknown) => {
+        console.warn(`[server] markStreaming(${rec.id}) failed:`, err instanceof Error ? err.message : err);
+        // The record can never reach in-progress now — the duration-cap
+        // timer never arms, and this session would otherwise run
+        // uncapped. Treat it as a wedged call and tear it down rather than
+        // let it run forever.
+        session.abort();
+      });
       session
         .run()
         .catch((err: unknown) => console.error("[server] call session error:", err))
@@ -175,11 +198,18 @@ export async function startServer(
     if (result !== "machine") return;
     const policy = rec.params.amdPolicy ?? cfg.defaults.amdPolicy;
     if (policy === "hangup") {
-      void manager.endCall(rec.id, "amd-hangup");
+      manager.endCall(rec.id, "amd-hangup").catch((err: unknown) => {
+        console.warn(`[server] endCall(${rec.id}, "amd-hangup") failed:`, err instanceof Error ? err.message : err);
+      });
       return;
     }
     if (activeSession?.id === rec.id) {
       activeSession.switchToVoicemail();
+    } else {
+      // No stream has connected yet for this call — stash it; the upgrade
+      // handler above replays it via switchToVoicemail() as soon as the
+      // session is constructed.
+      pendingVoicemailCallId = rec.id;
     }
   });
 
@@ -202,7 +232,7 @@ export async function startServer(
     // Close it before propagating the failure so a caller that catches
     // startServer's rejection isn't left with a leaked listener they have
     // no handle to.
-    await closeServer(publicServer).catch(() => {
+    await Promise.all([closeWss(wss), closeServer(publicServer)]).catch(() => {
       // Best-effort: publicServer is already being torn down; a failure
       // here must not mask the real error below.
     });
@@ -214,9 +244,28 @@ export async function startServer(
     publicServer,
     controlServer,
     async close() {
-      await Promise.all([closeServer(publicServer), closeServer(controlServer)]);
+      // wss (noServer: true) has no listening socket of its own — closing
+      // it only waits for its tracked clients to disconnect, and it never
+      // terminates them itself. Without explicitly terminating them first,
+      // a call still mid-stream leaves an upgraded socket open that
+      // publicServer.close() (which, as the underlying net.Server, also
+      // waits for every accepted connection to end) then waits on forever.
+      await Promise.all([closeWss(wss), closeServer(publicServer), closeServer(controlServer)]);
     }
   };
+}
+
+// Terminates every client currently tracked by a `noServer: true`
+// WebSocketServer, then closes it. wss.close() alone only stops it from
+// accepting further upgrades and waits for existing clients to disconnect
+// on their own — it never terminates them (see WebSocketServer.close's own
+// doc comment: "emit the 'close' event when all existing connections are
+// closed").
+function closeWss(server: WebSocketServer): Promise<void> {
+  for (const client of server.clients) {
+    client.terminate();
+  }
+  return new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
 function listen(server: Server, port: number, host?: string): Promise<void> {
