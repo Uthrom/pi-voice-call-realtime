@@ -126,7 +126,7 @@ This is the manual acceptance test from the design spec's §9 testing section: i
 
 ## Known limitations / post-setup validation
 
-The pi extension (`extension/voice-call.ts`) was built against pi's published extension docs — `registerTool`/`registerCommand` shapes, the tool `execute` signature, TypeBox parameter schemas — but there was no local pi installation available during development to actually load it into. Everything in `extension/` is unit-tested against a stubbed HTTP layer (`VoiceBridgeClient`), and `npx tsc --noEmit` type-checks the whole repo including the extension, but **the extension's integration with pi itself is docs-verified, not load-tested**.
+The pi extension (`extension/voice-call.ts`) was built against pi's published extension docs — `registerTool`/`registerCommand` shapes, the tool `execute` signature, TypeBox parameter schemas — but there was no local pi installation available during development to actually load it into. `extension/client.ts` — where all the logic lives — is unit-tested against a stubbed HTTP layer; `extension/voice-call.ts` is thin wiring that is type-checked but not unit-tested, and its integration with pi is docs-verified, not load-tested.
 
 First-run checklist:
 1. Symlink the extension (above) and start/restart pi.
