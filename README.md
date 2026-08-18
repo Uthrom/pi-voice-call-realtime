@@ -85,6 +85,22 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 Notes:
 - `twilio.accountSid` / `twilio.authToken` and `openai.apiKey` can instead be supplied via env vars `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `OPENAI_API_KEY`, which override the file when set to a non-empty value.
 - `serve.tunnel` can be `"cloudflared"` (default), `"ngrok"`, or `"none"` (in which case set `serve.publicUrl` to a static HTTPS URL you manage yourself, e.g. a reverse proxy).
+- **Quick tunnels can be unreliable — a named Cloudflare Tunnel is strongly recommended for real use.** On some networks, trycloudflare quick tunnels intermittently 502 webhooks and break WebSocket upgrades entirely (observed live; Twilio errors 15003/31920 — the call answers and immediately drops). If you have a domain on Cloudflare, set up a permanent tunnel once:
+  ```bash
+  cloudflared tunnel login                       # pick your zone in the browser
+  cloudflared tunnel create pi-voice
+  cloudflared tunnel route dns pi-voice voice.yourdomain.com
+  # ~/.cloudflared/config.yml:
+  #   tunnel: <tunnel-id>
+  #   credentials-file: /Users/you/.cloudflared/<tunnel-id>.json
+  #   protocol: http2
+  #   ingress:
+  #     - hostname: voice.yourdomain.com
+  #       service: http://127.0.0.1:3334
+  #     - service: http_status:404
+  cloudflared tunnel run pi-voice                # keep running (launchd/tmux)
+  ```
+  Then set `"tunnel": "none"` and `"publicUrl": "https://voice.yourdomain.com"` in `~/.pi-voice/config.json`. Twilio gets a stable URL that survives daemon restarts.
 - `limits`, `defaults`, and both ports all have the defaults shown above if omitted — the file only needs `twilio`, `openai`, and `serve.controlToken`.
 
 ## Running the daemon
