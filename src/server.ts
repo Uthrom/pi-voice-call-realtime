@@ -1,6 +1,8 @@
 import { createServer } from "node:http";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { URL } from "node:url";
+import { WebSocketServer } from "ws";
 import type { Config } from "./config.js";
 import { CallStore } from "./store.js";
 import { CallManager } from "./manager.js";
@@ -8,15 +10,27 @@ import type { TelephonyProvider } from "./manager.js";
 import { TwilioProvider } from "./providers/twilio.js";
 import { ReplayCache, publicUrlFor } from "./webhook-security.js";
 import { createPublicHandler } from "./webhook.js";
+import { MediaStreamConnection } from "./media-stream.js";
+import { RealtimeSession } from "./realtime.js";
+import { ManagedRealtimeSession } from "./managed-realtime.js";
+import { summarizeCall } from "./summary.js";
+import { CallSession } from "./call-session.js";
+import type { CallRecord } from "./types.js";
 
-// The injectable set of collaborators startServer wires together. Kept
-// minimal for this task (assembly only, no realtime wiring yet) — a later
-// task (media stream / control API) extends this.
+const STREAM_PATH = "/voice/stream";
+
+// The injectable set of collaborators startServer wires together. Task 12
+// extends this with the audio-path composition root's own dependencies:
+// `realtimeFactory` (how a call's RealtimeSession/ManagedRealtimeSession is
+// constructed — overridden in tests to point at a fake realtime server via
+// urlOverride) and `summarize` (call-end summarization).
 export interface Deps {
   store: CallStore;
   provider: TelephonyProvider;
   replay: ReplayCache;
   publicUrl: () => string;
+  realtimeFactory: (opts: ConstructorParameters<typeof RealtimeSession>[0]) => ManagedRealtimeSession | RealtimeSession;
+  summarize: typeof summarizeCall;
 }
 
 export async function startServer(
@@ -56,6 +70,17 @@ export async function startServer(
     fromNumber: cfg.twilio.fromNumber
   });
 
+  const realtimeFactory =
+    overrides?.realtimeFactory ??
+    ((opts: ConstructorParameters<typeof RealtimeSession>[0]) =>
+      // connectTimeoutMs/maxReconnectAttempts are set here (not left at
+      // ManagedRealtimeSession's defaults): the managed wrapper's
+      // worst-case connect wall time with defaults is ~65s (5 attempts x
+      // 10s ack timeout + backoff), far beyond what a live phone call can
+      // wait through — see task-9's note for Task 12.
+      new ManagedRealtimeSession({ ...opts, connectTimeoutMs: 5000, maxReconnectAttempts: 2 }));
+  const summarize = overrides?.summarize ?? summarizeCall;
+
   const handler = createPublicHandler({
     manager,
     authToken: cfg.twilio.authToken,
@@ -77,6 +102,85 @@ export async function startServer(
         res.end();
       }
     });
+  });
+
+  // Media-stream WS upgrade: GET /voice/stream?token=<streamToken>. The
+  // token is validated synchronously here, before the WS handshake ever
+  // completes, so an invalid/unknown token never gets as far as exchanging
+  // a single frame (global-constraints.md: the public listener serves
+  // nothing beyond the webhook + this one upgrade path).
+  const wss = new WebSocketServer({ noServer: true });
+  // MVP tracks at most one live call (maxConcurrentCalls=1) — this is the
+  // CallSession for whichever call currently has a connected media stream,
+  // used only to route the AMD leave-message branch (below) to a live
+  // realtime session.
+  let activeSession: CallSession | undefined;
+
+  publicServer.on("upgrade", (req, socket, head) => {
+    let pathname: string;
+    let token: string | null;
+    try {
+      const requestUrl = new URL(req.url ?? "/", "http://internal");
+      pathname = requestUrl.pathname;
+      token = requestUrl.searchParams.get("token");
+    } catch {
+      socket.destroy();
+      return;
+    }
+
+    if (pathname !== STREAM_PATH) {
+      socket.destroy();
+      return;
+    }
+
+    const rec = token ? manager.getByStreamToken(token) : undefined;
+    if (!rec) {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      // Forwarding closures: MediaStreamConnection's handlers must be
+      // supplied at its own construction — necessarily before the
+      // CallSession that needs this MediaStreamConnection as one of its
+      // own deps can exist. `session` is assigned synchronously right
+      // after; these closures only ever run later, asynchronously, off the
+      // socket's own event loop, so it's always assigned by then.
+      let session: CallSession;
+      const media = new MediaStreamConnection(ws, {
+        onStart: () => {},
+        onAudio: (mulaw) => session.onCallerAudio(mulaw),
+        onStop: () => session.onMediaStop()
+      });
+      session = new CallSession({ record: rec, manager, media, realtimeFactory, config: cfg, summarize });
+      activeSession = session;
+      void manager.markStreaming(rec.id);
+      session
+        .run()
+        .catch((err: unknown) => console.error("[server] call session error:", err))
+        .finally(() => {
+          if (activeSession === session) activeSession = undefined;
+        });
+    });
+  });
+
+  // AMD routing lives here rather than inside CallSession: a "machine" +
+  // "hangup" event can arrive before any media stream — and therefore any
+  // CallSession — ever connects (Twilio's AMD callback and the
+  // <Connect><Stream> negotiation race independently), so the hangup branch
+  // must not depend on a live session existing. "leave-message" does need a
+  // live realtime session, so that branch is routed to whichever
+  // CallSession is currently active for this call.
+  manager.on("amd", (rec: CallRecord, result: "human" | "machine") => {
+    if (result !== "machine") return;
+    const policy = rec.params.amdPolicy ?? cfg.defaults.amdPolicy;
+    if (policy === "hangup") {
+      void manager.endCall(rec.id, "amd-hangup");
+      return;
+    }
+    if (activeSession?.id === rec.id) {
+      activeSession.switchToVoicemail();
+    }
   });
 
   // Task 13 mounts the full control API (initiate/status/transcript/end);

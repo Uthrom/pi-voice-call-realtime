@@ -26,6 +26,15 @@ interface ManagedRealtimeSessionOpts {
   tools: RealtimeToolDef[];
   callbacks: RealtimeCallbacks;
   urlOverride?: string;
+  // Forwarded to the inner RealtimeSession via the `{ ...opts }` spread in
+  // the constructor below (RealtimeSessionOpts already accepts it) — not
+  // read by this class itself. Task-9's report flagged this as missing:
+  // without it, a caller has no way to bound the managed wrapper's
+  // worst-case connect wall time (~65s with every default: 5 reconnect
+  // attempts x the 10s per-attempt ack timeout, plus backoff) to something
+  // a live phone call can actually wait through. Task 12's server.ts
+  // factory sets this to 5000.
+  connectTimeoutMs?: number;
   // Testability hooks — real callers never need these, defaults match the
   // brief exactly. Kept optional so `ConstructorParameters<typeof
   // RealtimeSession>[0]` remains structurally assignable to this type.
