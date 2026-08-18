@@ -162,7 +162,8 @@ describe("CallManager", () => {
     expect(provider.hangupCalls).toEqual(["CA1"]);
     const saved = await store.get(rec.id);
     expect(saved?.status).toBe("completed");
-    expect(saved?.error).toBe("duration-cap");
+    expect(saved?.endReason).toBe("duration-cap");
+    expect(saved?.error).toBeUndefined();
   });
 
   it("(g) getByStreamToken returns the active record and undefined after terminal", async () => {
@@ -207,15 +208,132 @@ describe("CallManager", () => {
     expect(saved?.status).toBe("in-progress");
   });
 
-  it("markStreaming is ignored with a warn log (no throw) for a call not yet answered", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { manager } = makeManager();
+  it("markStreaming is ignored with a warn log (no throw) for an already-terminal call", async () => {
+    const { manager, store } = makeManager();
     const rec = await manager.initiateCall(makeParams());
+    await manager.handleProviderEvent({ type: "completed", providerCallId: "CA1", providerStatus: "failed" });
 
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await expect(manager.markStreaming(rec.id)).resolves.toBeUndefined();
-    expect(manager.getActive()?.status).toBe("dialing");
     expect(warn).toHaveBeenCalledTimes(1);
     warn.mockRestore();
+
+    const saved = await store.get(rec.id);
+    expect(saved?.status).toBe("failed");
+  });
+
+  it("markStreaming from ringing reaches in-progress, stamps answeredAt, and arms the timer; a later answered event is then a silent no-op", async () => {
+    const { manager, provider, store } = makeManager();
+    const rec = await manager.initiateCall(makeParams());
+    await manager.handleProviderEvent({ type: "ringing", providerCallId: "CA1" });
+
+    await manager.markStreaming(rec.id);
+
+    let saved = await store.get(rec.id);
+    expect(saved?.status).toBe("in-progress");
+    expect(saved?.answeredAt).toBeTruthy();
+    const firstAnsweredAt = saved?.answeredAt;
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await manager.handleProviderEvent({ type: "answered", providerCallId: "CA1" });
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+
+    saved = await store.get(rec.id);
+    expect(saved?.status).toBe("in-progress"); // unchanged
+    expect(saved?.answeredAt).toBe(firstAnsweredAt); // not re-stamped
+
+    // The timer markStreaming armed still governs this call — advancing
+    // past maxDurationSec ends it via the provider hangup exactly once.
+    await vi.advanceTimersByTimeAsync(LIMITS.maxDurationSec * 1000 + 1000);
+    vi.useRealTimers();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(provider.hangupCalls).toEqual(["CA1"]);
+    saved = await store.get(rec.id);
+    expect(saved?.status).toBe("completed");
+    expect(saved?.endReason).toBe("duration-cap");
+  });
+
+  it("a stale non-active record's answered event does not disturb the active call's duration timer", async () => {
+    const { manager, provider, store } = makeManager();
+    // A leftover non-terminal record from a previous process — not tracked
+    // as `active` by this manager instance, but still findable by
+    // providerCallId (e.g. a very late/duplicate Twilio webhook).
+    const stale: CallRecord = {
+      id: "stale-id",
+      providerCallId: "STALE1",
+      params: makeParams(),
+      status: "ringing",
+      streamToken: "stale-token",
+      createdAt: new Date().toISOString()
+    };
+    await store.save(stale);
+
+    const rec = await manager.initiateCall(makeParams());
+    await manager.handleProviderEvent({ type: "answered", providerCallId: "CA1" });
+
+    await manager.handleProviderEvent({ type: "answered", providerCallId: "STALE1" });
+
+    const staleSaved = await store.get("stale-id");
+    expect(staleSaved?.status).toBe("answered"); // the stale record's own state still updates...
+
+    await vi.advanceTimersByTimeAsync(LIMITS.maxDurationSec * 1000 + 1000);
+    vi.useRealTimers();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // ...but the duration cap fired for the real active call only.
+    expect(provider.hangupCalls).toEqual(["CA1"]);
+    const activeSaved = await store.get(rec.id);
+    expect(activeSaved?.status).toBe("completed");
+  });
+
+  it("concurrent double-initiateCall yields exactly one dialing record and one CapacityError", async () => {
+    const { manager, store } = makeManager();
+
+    const results = await Promise.allSettled([manager.initiateCall(makeParams()), manager.initiateCall(makeParams())]);
+
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<CallRecord> => r.status === "fulfilled");
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toBeInstanceOf(CapacityError);
+    expect(fulfilled[0]?.value.status).toBe("dialing");
+
+    const list = await store.list();
+    expect(list).toHaveLength(1);
+    expect(list[0]?.status).toBe("dialing");
+  });
+
+  it("interleaved amd + answered event handlers preserve answeredAt and status (no lost update)", async () => {
+    const { manager, store } = makeManager();
+    const rec = await manager.initiateCall(makeParams());
+
+    // Delay only the first store.save() reached after this point, to
+    // simulate the "answered" handler's write overlapping with the AMD
+    // callback's own handling. Without serialization, the AMD handler could
+    // read a stale pre-answered snapshot and write it back after, erasing
+    // status/answeredAt.
+    const originalSave = store.save.bind(store);
+    let delayedOnce = false;
+    const saveSpy = vi.spyOn(store, "save").mockImplementation(async (r) => {
+      if (!delayedOnce) {
+        delayedOnce = true;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      return originalSave(r);
+    });
+
+    const answeredPromise = manager.handleProviderEvent({ type: "answered", providerCallId: "CA1" });
+    const amdPromise = manager.handleProviderEvent({ type: "amd", providerCallId: "CA1", result: "machine" });
+
+    await Promise.all([answeredPromise, amdPromise, vi.advanceTimersByTimeAsync(10)]);
+
+    const saved = await store.get(rec.id);
+    expect(saved?.status).toBe("answered");
+    expect(saved?.answeredAt).toBeTruthy();
+    expect(saved?.amdResult).toBe("machine");
+    saveSpy.mockRestore();
   });
 
   it("handleProviderEvent for an unknown providerCallId is ignored with a warn log, not thrown", async () => {
@@ -240,7 +358,8 @@ describe("CallManager", () => {
     expect(provider.hangupCalls).toEqual(["CA1"]);
     const saved = await store.get(rec.id);
     expect(saved?.status).toBe("completed");
-    expect(saved?.error).toBe("operator");
+    expect(saved?.endReason).toBe("operator");
+    expect(saved?.error).toBeUndefined();
     expect(manager.getActive()).toBeUndefined();
   });
 

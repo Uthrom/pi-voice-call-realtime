@@ -35,8 +35,8 @@ export class DailyCapError extends Error {}
 const RING_TIMEOUT_SEC = 30;
 
 // Forward order of the pre-answer chain. Used to reject a provider event
-// that would move a call backwards (e.g. a stale "ringing" arriving after
-// "answered" already landed) instead of clobbering later state.
+// that would move a call backwards, or re-apply one already applied (e.g. a
+// duplicate "answered" webhook), instead of clobbering later state.
 const CHAIN_ORDER: readonly CallStatus[] = ["queued", "dialing", "ringing", "answered", "in-progress"];
 
 const COMPLETED_STATUS_MAP: Readonly<Record<string, CallStatus>> = {
@@ -58,7 +58,21 @@ export class CallManager extends EventEmitter {
   // MVP tracks a single active call in memory (matches the maxConcurrentCalls
   // default of 1); a second slot would require reworking this to a map.
   private active: CallRecord | undefined;
-  private durationTimer: NodeJS.Timeout | undefined;
+  // Bound to the call that armed it, so a stale/non-active record's provider
+  // event can never disarm or retarget the active call's cap.
+  private durationTimer: { callId: string; handle: NodeJS.Timeout } | undefined;
+
+  // Serializes every mutating operation (initiateCall, handleProviderEvent,
+  // endCall, finalize, markStreaming) into a single FIFO queue. Twilio
+  // delivers status/AMD/stream-attach signals as independently-arriving,
+  // overlapping async calls; without this, two handlers can each snapshot
+  // the same record and the one whose `store.save` settles last silently
+  // clobbers the other's update (lost update), and two concurrent
+  // initiateCall calls can both observe capacity/daily-cap as available
+  // before either claims it (TOCTOU). The private `*Core`/internal methods
+  // below must never call `lock` themselves — they already run inside a
+  // locked turn, and re-entering would deadlock against their own caller.
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor(opts: {
     store: CallStore;
@@ -78,10 +92,49 @@ export class CallManager extends EventEmitter {
   }
 
   async initiateCall(params: CallParams): Promise<CallRecord> {
-    // This MVP tracks exactly one active call in memory (see `active` field),
-    // so it can only ever honor a maxConcurrentCalls of 1 — the configured
-    // default. A slot is occupied whenever `active` is set, independent of
-    // the configured value.
+    return this.lock(() => this.initiateCallCore(params));
+  }
+
+  async handleProviderEvent(evt: ProviderCallEvent): Promise<void> {
+    return this.lock(() => this.handleProviderEventCore(evt));
+  }
+
+  async endCall(id: string, reason: string): Promise<void> {
+    return this.lock(() => this.endCallCore(id, reason));
+  }
+
+  async finalize(id: string, status: CallStatus, error?: string): Promise<void> {
+    return this.lock(() => this.finalizeInternal(id, status, { error }));
+  }
+
+  async markStreaming(id: string): Promise<void> {
+    return this.lock(() => this.markStreamingCore(id));
+  }
+
+  getActive(): CallRecord | undefined {
+    return this.active;
+  }
+
+  getByStreamToken(token: string): CallRecord | undefined {
+    return this.active?.streamToken === token ? this.active : undefined;
+  }
+
+  private lock<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(fn, fn);
+    this.queue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
+  private async initiateCallCore(params: CallParams): Promise<CallRecord> {
+    // This MVP tracks exactly one active call in memory (see `active`
+    // field), so it can only ever honor a maxConcurrentCalls of 1 — the
+    // configured default. A slot is occupied whenever `active` is set,
+    // independent of the configured value. Serialization via `lock` means
+    // this check and the claim below can no longer race with another
+    // initiateCall.
     if (this.active !== undefined) {
       throw new CapacityError(
         `at capacity: a call is already active (maxConcurrentCalls=${this.limits.maxConcurrentCalls})`
@@ -121,12 +174,12 @@ export class CallManager extends EventEmitter {
       // pending record as failed instead of leaving it wedged as the
       // permanently-active call (which would lock out every future call).
       const message = err instanceof Error ? err.message : String(err);
-      await this.finalize(pending.id, "failed", message);
+      await this.finalizeInternal(pending.id, "failed", { error: message });
       throw err;
     }
   }
 
-  async handleProviderEvent(evt: ProviderCallEvent): Promise<void> {
+  private async handleProviderEventCore(evt: ProviderCallEvent): Promise<void> {
     const rec = await this.getRecordByProviderCallId(evt.providerCallId);
     if (!rec) {
       this.warnIgnored(evt.type, evt.providerCallId, "no matching call record");
@@ -135,20 +188,24 @@ export class CallManager extends EventEmitter {
 
     switch (evt.type) {
       case "amd":
-        await this.handleAmdEvent(rec, evt.result);
+        await this.handleAmdEventCore(rec, evt.result);
         return;
       case "completed":
-        await this.handleCompletedEvent(rec, evt.providerStatus);
+        await this.handleCompletedEventCore(rec, evt.providerStatus);
         return;
       case "initiated":
+        // "dialing" is already set synchronously by initiateCall before any
+        // provider event can arrive; this event only confirms what we
+        // already know, so it's always a silent no-op.
+        return;
       case "ringing":
       case "answered":
-        await this.handleProgressEvent(rec, evt.type);
+        await this.handleProgressEventCore(rec, evt.type);
         return;
     }
   }
 
-  async endCall(id: string, reason: string): Promise<void> {
+  private async endCallCore(id: string, reason: string): Promise<void> {
     const rec = await this.getRecord(id);
     if (!rec) {
       console.warn(`[CallManager] endCall: no record found for id ${id}`);
@@ -167,10 +224,20 @@ export class CallManager extends EventEmitter {
       }
     }
 
-    await this.finalize(id, "completed", reason);
+    // Non-error termination — the reason lives in `endReason`, not `error`
+    // (that field is reserved for genuine failures).
+    await this.finalizeInternal(id, "completed", { endReason: reason });
   }
 
-  async finalize(id: string, status: CallStatus, error?: string): Promise<void> {
+  // Shared core for the public `finalize` and every internal caller that
+  // needs to terminate a record (initiateCall's createCall failure,
+  // endCall, a "completed" provider event). `error` is for genuine
+  // failures; `endReason` is for benign/expected terminations.
+  private async finalizeInternal(
+    id: string,
+    status: CallStatus,
+    extra: { error?: string; endReason?: string } = {}
+  ): Promise<void> {
     const rec = await this.getRecord(id);
     if (!rec) {
       console.warn(`[CallManager] finalize: no record found for id ${id}`);
@@ -185,38 +252,42 @@ export class CallManager extends EventEmitter {
       ...rec,
       status,
       endedAt: new Date(this.now()).toISOString(),
-      ...(error !== undefined ? { error } : {})
+      ...(extra.error !== undefined ? { error: extra.error } : {}),
+      ...(extra.endReason !== undefined ? { endReason: extra.endReason } : {})
     };
     await this.persist(updated);
     this.emit("status", updated);
     this.emit("ended", updated);
   }
 
-  async markStreaming(id: string): Promise<void> {
+  private async markStreamingCore(id: string): Promise<void> {
     const rec = await this.getRecord(id);
     if (!rec) {
       console.warn(`[CallManager] markStreaming: no record found for id ${id}`);
       return;
     }
-    if (rec.status !== "answered") {
-      this.warnIgnored("markStreaming", rec.providerCallId ?? id, `call ${id} not in "answered" state (${rec.status})`);
+    if (TERMINAL_STATUSES.has(rec.status)) {
+      this.warnIgnored("markStreaming", rec.providerCallId ?? id, `call ${id} already terminal (${rec.status})`);
       return;
     }
+    if (rec.status === "in-progress") {
+      return; // already streaming — idempotent no-op
+    }
 
+    // Legal from any non-terminal state: the media stream can attach
+    // (Twilio <Connect><Stream>) before the provider's own "answered"
+    // status callback lands, so this can't require rec.status === "answered".
     const updated: CallRecord = { ...rec, status: "in-progress" };
+    if (!updated.answeredAt) {
+      updated.answeredAt = new Date(this.now()).toISOString();
+    }
+
     await this.persist(updated);
     this.emit("status", updated);
+    this.armDurationTimer(updated);
   }
 
-  getActive(): CallRecord | undefined {
-    return this.active;
-  }
-
-  getByStreamToken(token: string): CallRecord | undefined {
-    return this.active?.streamToken === token ? this.active : undefined;
-  }
-
-  private async handleAmdEvent(rec: CallRecord, result: "human" | "machine"): Promise<void> {
+  private async handleAmdEventCore(rec: CallRecord, result: "human" | "machine"): Promise<void> {
     if (TERMINAL_STATUSES.has(rec.status)) {
       this.warnIgnored("amd", rec.providerCallId ?? rec.id, `call ${rec.id} already terminal (${rec.status})`);
       return;
@@ -226,7 +297,7 @@ export class CallManager extends EventEmitter {
     this.emit("amd", updated, result);
   }
 
-  private async handleCompletedEvent(rec: CallRecord, providerStatus: string): Promise<void> {
+  private async handleCompletedEventCore(rec: CallRecord, providerStatus: string): Promise<void> {
     if (TERMINAL_STATUSES.has(rec.status)) {
       this.warnIgnored("completed", rec.providerCallId ?? rec.id, `call ${rec.id} already terminal (${rec.status})`);
       return;
@@ -236,33 +307,42 @@ export class CallManager extends EventEmitter {
       this.warnIgnored("completed", rec.providerCallId ?? rec.id, `unrecognized providerStatus "${providerStatus}"`);
       return;
     }
-    await this.finalize(rec.id, mapped);
+    await this.finalizeInternal(rec.id, mapped);
   }
 
-  private async handleProgressEvent(rec: CallRecord, type: "initiated" | "ringing" | "answered"): Promise<void> {
+  private async handleProgressEventCore(rec: CallRecord, type: "ringing" | "answered"): Promise<void> {
     if (TERMINAL_STATUSES.has(rec.status)) {
       this.warnIgnored(type, rec.providerCallId ?? rec.id, `call ${rec.id} already terminal (${rec.status})`);
       return;
     }
 
-    const target: CallStatus = type === "initiated" ? "dialing" : type;
+    if (type === "answered" && rec.status === "in-progress") {
+      // markStreaming can promote a call straight to in-progress before the
+      // provider's own "answered" status callback lands — expected
+      // real-world ordering, not an error. Silent (no warn).
+      return;
+    }
+
     const currentIdx = CHAIN_ORDER.indexOf(rec.status);
-    const targetIdx = CHAIN_ORDER.indexOf(target);
-    if (currentIdx === -1 || targetIdx < currentIdx) {
+    const targetIdx = CHAIN_ORDER.indexOf(type);
+    // Strictly forward only: rejects backward moves AND repeats (e.g. a
+    // duplicate "answered" webhook), which would otherwise re-stamp
+    // answeredAt / re-emit "answered" / re-arm the duration timer.
+    if (currentIdx === -1 || targetIdx <= currentIdx) {
       this.warnIgnored(type, rec.providerCallId ?? rec.id, `out of order for call ${rec.id} (status ${rec.status})`);
       return;
     }
 
-    const updated: CallRecord = { ...rec, status: target };
-    if (target === "answered") {
+    const updated: CallRecord = { ...rec, status: type };
+    if (type === "answered") {
       updated.answeredAt = new Date(this.now()).toISOString();
     }
 
     await this.persist(updated);
     this.emit("status", updated);
-    if (target === "answered") {
+    if (type === "answered") {
       this.emit("answered", updated);
-      this.startDurationTimer(updated);
+      this.armDurationTimer(updated);
     }
   }
 
@@ -291,19 +371,26 @@ export class CallManager extends EventEmitter {
     }
   }
 
-  private startDurationTimer(rec: CallRecord): void {
-    this.clearDurationTimer();
+  // Idempotent and call-bound: a duplicate/late signal for the call that
+  // already armed the timer is a no-op, and a signal for any call other
+  // than the currently-active one (e.g. a stale non-terminal record left
+  // over from a previous process) can never arm or disarm the active
+  // call's timer.
+  private armDurationTimer(rec: CallRecord): void {
+    if (rec.id !== this.active?.id) return;
+    if (this.durationTimer?.callId === rec.id) return;
+
     const maxDurationSec = rec.params.maxDurationSec ?? this.limits.maxDurationSec;
-    const timer = setTimeout(() => {
+    const handle = setTimeout(() => {
       void this.endCall(rec.id, "duration-cap");
     }, maxDurationSec * 1000);
-    timer.unref();
-    this.durationTimer = timer;
+    handle.unref();
+    this.durationTimer = { callId: rec.id, handle };
   }
 
   private clearDurationTimer(): void {
     if (this.durationTimer) {
-      clearTimeout(this.durationTimer);
+      clearTimeout(this.durationTimer.handle);
       this.durationTimer = undefined;
     }
   }

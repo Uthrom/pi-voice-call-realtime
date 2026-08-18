@@ -50,5 +50,6 @@ export interface CallRecord {
   outcome?: CallOutcome;
   summary?: string;
   transcriptPath?: string;
-  error?: string;
+  error?: string; // genuine failure only (e.g. createCall threw)
+  endReason?: string; // why a non-error termination happened (e.g. "duration-cap", "operator")
 }
