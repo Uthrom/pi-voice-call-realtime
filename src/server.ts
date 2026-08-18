@@ -18,6 +18,7 @@ import { ManagedRealtimeSession } from "./managed-realtime.js";
 import { summarizeCall } from "./summary.js";
 import { CallSession } from "./call-session.js";
 import type { CallRecord } from "./types.js";
+import { TERMINAL_STATUSES } from "./types.js";
 import { resolvePublicUrl } from "./tunnel.js";
 import type { Tunnel } from "./tunnel.js";
 
@@ -61,7 +62,7 @@ export function formatBanner(cfg: Config, publicUrl: string): string {
  * receive a second signal.
  */
 export function createShutdownHandler(opts: {
-  handle: Pick<Awaited<ReturnType<typeof startServer>>, "drainActiveSession" | "close">;
+  handle: Pick<Awaited<ReturnType<typeof startServer>>, "drainActiveSession" | "close" | "closeControl">;
   tunnel?: Tunnel;
   exit?: (code: number) => void;
 }): (signal: string) => Promise<void> {
@@ -75,9 +76,23 @@ export function createShutdownHandler(opts: {
     console.log(`[pi-voice] received ${signal}, shutting down...`);
 
     try {
+      // Stop accepting new work FIRST, before anything else. Without this,
+      // a POST /calls landing during the drain below could place a brand
+      // new real outbound call whose servers are then closed out from
+      // under it moments later. GET /health dying early on the control
+      // listener is an acceptable, deliberate side effect.
+      await opts.handle.closeControl();
+    } catch (err) {
+      console.warn("[pi-voice] closeControl() failed during shutdown:", err instanceof Error ? err.message : err);
+    }
+
+    try {
       // Give an in-flight call its own bounded chance to finish through its
       // normal path (see drainActiveSession's doc comment) before anything
-      // is torn down under it.
+      // is torn down under it. The public listener (webhooks + the media
+      // stream) and the tunnel must both stay up through this — Twilio
+      // still needs to reach them for whatever call is in flight — so
+      // neither is closed until after this resolves.
       await opts.handle.drainActiveSession();
     } catch (err) {
       console.warn("[pi-voice] drainActiveSession failed during shutdown:", err instanceof Error ? err.message : err);
@@ -134,6 +149,7 @@ export async function startServer(
   overrides?: Partial<Deps>
 ): Promise<{
   close(): Promise<void>;
+  closeControl(): Promise<void>;
   drainActiveSession(): Promise<void>;
   publicServer: Server;
   controlServer: Server;
@@ -354,58 +370,135 @@ export async function startServer(
   }
 
   /**
-   * Shutdown-time drain of whichever call is currently streaming (see
-   * `activeSession`/`activeRun` above), honoring both of this task's
-   * binding controller notes:
+   * Direct, manager-bypassing terminal write for a call whose graceful
+   * drain (drainCall, below) didn't finish in time. `CallManager`
+   * serializes every mutating operation through a single FIFO lock queue
+   * (see manager.ts) — if the reason a drain timed out is a provider call
+   * that's genuinely wedged (e.g. Twilio's hangup API hanging with no
+   * timeout of its own), any *further* manager-routed call — including
+   * `manager.finalize` — would simply queue up behind it and could never
+   * actually run before the process exits, making it useless as a "we
+   * gave up, mark this terminal" fallback (this was Task 14's original
+   * bug: the fallback called `manager.finalize`, fire-and-forget, and so
+   * could end up never actually applying). Writing straight through the
+   * `store` handle startServer already holds sidesteps the queue entirely
+   * — by the time this runs the process is on its way out, so the
+   * manager's in-memory state no longer matters.
+   *
+   * Guarded against clobbering a call that *did* finish finalizing through
+   * its normal path in the meantime (the common case: the manager-level
+   * finalize from `endCall` often completes almost immediately even when
+   * whatever else made the overall drain slow — e.g. summarization — is
+   * still running): returns `false` without writing anything when the
+   * record is already terminal.
+   */
+  async function forceTerminalRecord(id: string): Promise<boolean> {
+    try {
+      const rec = await store.get(id);
+      if (!rec || TERMINAL_STATUSES.has(rec.status)) return false;
+      const updated: CallRecord = {
+        ...rec,
+        status: "interrupted",
+        endedAt: new Date().toISOString(),
+        error: "shutdown-drain-timeout"
+      };
+      await store.save(updated);
+      return true;
+    } catch (err) {
+      console.warn(`[server] force-terminal write failed for ${id}:`, err instanceof Error ? err.message : err);
+      return false;
+    }
+  }
+
+  // Races `work` (whatever "drained gracefully" means for the caller —
+  // see drainActiveSession below) against `drainTimeoutMs`. On timeout,
+  // attempts forceTerminalRecord and logs accurately depending on whether
+  // it actually had to force a write or found the record already
+  // finalized through its normal path (previously this warned
+  // "force-finalizing" unconditionally, even on the no-op path).
+  async function drainCall(id: string, work: () => Promise<unknown>): Promise<void> {
+    const timedOut = await Promise.race([
+      work().then(() => false as const),
+      delay(drainTimeoutMs).then(() => true as const)
+    ]);
+    if (!timedOut) return;
+
+    const forced = await forceTerminalRecord(id);
+    if (forced) {
+      console.warn(
+        `[server] shutdown drain timed out after ${drainTimeoutMs}ms for call ${id}; forced a terminal record (interrupted)`
+      );
+    } else {
+      console.warn(
+        `[server] shutdown drain timed out after ${drainTimeoutMs}ms for call ${id}; it had already finalized through its normal path`
+      );
+    }
+  }
+
+  /**
+   * Shutdown-time drain, honoring both of this task's binding controller
+   * notes (createShutdownHandler closes the control listener before
+   * calling this, and keeps the public listener/tunnel up throughout it):
    *
    * 1. A bare `close()` resolves before an in-flight call's teardown
    *    completes (Task 12's note) — a daemon that exited right after
    *    close() would lose that call's last finalize/transcript/summary
-   *    writes. This asks the call to end gracefully
-   *    (`manager.endCall(id, "shutdown")` — safe to call even if the
-   *    manager is already independently tearing the same call down, since
-   *    endCall is itself an idempotent no-op on an already-terminal
-   *    record) and awaits the *session's* own completion signal
-   *    (`activeRun`, i.e. `CallSession.run()` — resolves only once the
-   *    record is persisted terminal with transcript/summary saved).
-   * 2. That wait is bounded by `drainTimeoutMs` (10s in production) so
-   *    shutdown itself can never hang forever. Reconciling the brief's
-   *    one-line "finalize any active call as interrupted" with note 1: a
-   *    call that finishes draining within the bound keeps whatever status
-   *    its normal endCall("shutdown") path produced — it is NOT forced to
-   *    "interrupted". Only once the bound elapses do we attempt to force
-   *    the record to "interrupted" — and even then, `manager.finalize` is
-   *    itself a no-op against an already-terminal record (the common case:
-   *    the manager-level finalize from endCall usually completes almost
-   *    immediately even when the *session's* own trailing async work —
-   *    transcript flush, summarization — is what's actually slow), so this
-   *    never clobbers a call that already finalized normally. The
-   *    force-finalize call is deliberately fire-and-forget (not awaited)
-   *    here: it can itself still be queued behind a slow provider call
-   *    inside CallManager's own serialized lock, and must never become a
-   *    second way for this function — and therefore shutdown — to hang
-   *    past its own bound.
+   *    writes. And a call still in its pre-stream dialing/ringing window
+   *    (no CallSession/`activeRun` yet — only a manager-tracked active
+   *    record, for up to Twilio's 30s ring timeout) was previously never
+   *    drained at all. Both cases are asked to end gracefully via
+   *    `manager.endCall(id, "shutdown")` (idempotent no-op if the manager
+   *    is already independently tearing the same call down); a call with
+   *    a live media stream additionally awaits its CallSession's own
+   *    completion signal (`activeRun` — resolves only once the record is
+   *    persisted terminal with transcript/summary saved).
+   * 2. Bounded by `drainTimeoutMs` (10s in production) so shutdown itself
+   *    can never hang forever. A call that finishes draining within the
+   *    bound keeps whatever status its normal endCall("shutdown") path
+   *    produced — never forced to "interrupted". Only past the bound does
+   *    `drainCall` force a terminal record (see forceTerminalRecord above).
    */
   async function drainActiveSession(): Promise<void> {
     const session = activeSession;
     const runPromise = activeRun;
-    if (!session || !runPromise) return;
 
-    const gracefulEnd = manager.endCall(session.id, "shutdown").catch((err: unknown) => {
-      console.warn(`[server] shutdown endCall(${session.id}) failed:`, err instanceof Error ? err.message : err);
-    });
-    const drained = Promise.all([gracefulEnd, runPromise]).then(() => true as const);
-
-    const timedOut = await Promise.race([drained.then(() => false as const), delay(drainTimeoutMs).then(() => true as const)]);
-
-    if (timedOut) {
-      console.warn(
-        `[server] shutdown drain timed out after ${drainTimeoutMs}ms for call ${session.id}; force-finalizing as interrupted`
+    if (session && runPromise) {
+      await drainCall(session.id, () =>
+        Promise.all([
+          manager.endCall(session.id, "shutdown").catch((err: unknown) => {
+            console.warn(`[server] shutdown endCall(${session.id}) failed:`, err instanceof Error ? err.message : err);
+          }),
+          runPromise
+        ])
       );
-      manager.finalize(session.id, "interrupted").catch((err: unknown) => {
-        console.warn(`[server] force-finalize(interrupted) failed for ${session.id}:`, err instanceof Error ? err.message : err);
-      });
+      return;
     }
+
+    // No live media stream (still dialing/ringing) but the manager still
+    // has an active record — the pre-stream window note 2 was flagged
+    // for: a real outbound call in flight with no CallSession to drain via
+    // the branch above.
+    const active = manager.getActive();
+    if (!active) return;
+
+    await drainCall(active.id, () =>
+      manager.endCall(active.id, "shutdown").catch((err: unknown) => {
+        console.warn(`[server] shutdown endCall(${active.id}) failed:`, err instanceof Error ? err.message : err);
+      })
+    );
+  }
+
+  /**
+   * Closes only the loopback control listener — the first step of
+   * shutdown (see createShutdownHandler), so `POST /calls` (and every
+   * other control route) stops accepting new work before the drain below
+   * gives whatever call is already in flight a chance to finish. The
+   * public listener (webhooks + the media stream) and any tunnel process
+   * deliberately stay up through the drain — Twilio still needs to reach
+   * them for that in-flight call.
+   */
+  async function closeControl(): Promise<void> {
+    await closeServer(controlServer);
   }
 
   return {
@@ -413,6 +506,7 @@ export async function startServer(
     publicServer,
     controlServer,
     drainActiveSession,
+    closeControl,
     async close() {
       // wss (noServer: true) has no listening socket of its own — closing
       // it only waits for its tracked clients to disconnect, and it never
@@ -426,26 +520,51 @@ export async function startServer(
 }
 
 /**
- * Daemon entrypoint: loadConfig -> resolvePublicUrl (static override or a
- * spawned cloudflared/ngrok tunnel) -> startServer -> print the (secret-free)
- * startup banner -> wire SIGINT/SIGTERM to the shared shutdown sequence
- * (drain -> close -> tunnel.close -> exit). Not unit-tested itself — it's
- * thin composition over pieces (formatBanner, createShutdownHandler,
- * resolvePublicUrl, startServer) that are each tested on their own; only
- * runs at all when this file is executed directly (see the import.meta.url
- * guard below), never when it's merely imported by tests.
+ * Resolves the public URL/tunnel and starts the server. Extracted from
+ * main() so the startup-failure cleanup path below is directly testable
+ * without touching real config/env or registering real process signal
+ * handlers.
+ *
+ * If startServer() fails after a tunnel process was already spawned (e.g.
+ * EADDRINUSE on the public port — the everyday case of a second daemon
+ * instance, or a leftover from a previous run), the spawned cloudflared/
+ * ngrok child must be closed here — left running, it's both leaked (never
+ * killed) AND its own flowing stdio pipes keep the Node event loop alive,
+ * so the fatal-error handler at the bottom of this file would print the
+ * error and then hang forever instead of actually exiting.
+ */
+export async function bootDaemon(
+  cfg: Config,
+  spawnImpl?: Parameters<typeof resolvePublicUrl>[1]
+): Promise<{ handle: Awaited<ReturnType<typeof startServer>>; tunnel?: Tunnel; publicUrl: string }> {
+  const { url: publicUrl, tunnel } = await resolvePublicUrl(cfg, spawnImpl);
+  const runtimeCfg: Config = { ...cfg, serve: { ...cfg.serve, publicUrl } };
+
+  try {
+    const handle = await startServer(runtimeCfg);
+    return { handle, tunnel, publicUrl };
+  } catch (err) {
+    await tunnel?.close().catch(() => {
+      // Best-effort: startServer's own failure is the real error to
+      // propagate below; a failure tearing down the tunnel must not mask it.
+    });
+    throw err;
+  }
+}
+
+/**
+ * Daemon entrypoint: loadConfig -> bootDaemon (resolvePublicUrl + startServer)
+ * -> print the (secret-free) startup banner -> wire SIGINT/SIGTERM to the
+ * shared shutdown sequence (closeControl -> drain -> close -> tunnel.close
+ * -> exit). Not unit-tested itself — it's thin composition over pieces
+ * (formatBanner, createShutdownHandler, bootDaemon) that are each tested on
+ * their own; only runs at all when this file is executed directly (see the
+ * import.meta.url guard below), never when it's merely imported by tests.
  */
 async function main(): Promise<void> {
   const cfg = loadConfig();
-  const { url: publicUrl, tunnel } = await resolvePublicUrl(cfg);
-  // Threading the resolved URL back through cfg.serve.publicUrl (rather
-  // than overriding startServer's `publicUrl` dep directly) is the wiring
-  // startServer already anticipated — see its own `publicUrl` default's
-  // comment ("Task 14 wires that up").
-  const runtimeCfg: Config = { ...cfg, serve: { ...cfg.serve, publicUrl } };
-
-  const handle = await startServer(runtimeCfg);
-  console.log(formatBanner(runtimeCfg, publicUrl));
+  const { handle, tunnel, publicUrl } = await bootDaemon(cfg);
+  console.log(formatBanner({ ...cfg, serve: { ...cfg.serve, publicUrl } }, publicUrl));
 
   const shutdown = createShutdownHandler({ handle, tunnel });
   process.on("SIGINT", () => void shutdown("SIGINT"));
@@ -455,7 +574,13 @@ async function main(): Promise<void> {
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   main().catch((err: unknown) => {
     console.error("[pi-voice] fatal startup error:", err);
-    process.exitCode = 1;
+    // A plain process.exitCode assignment only takes effect once the event
+    // loop naturally drains — but bootDaemon's own tunnel-cleanup aside, a
+    // startup failure can still leave something with flowing stdio/open
+    // handles alive (e.g. a listener error handler on the other server).
+    // process.exit(1) forces the process down immediately rather than
+    // risking a silent hang after printing the error.
+    process.exit(1);
   });
 }
 
@@ -495,7 +620,15 @@ function listen(server: Server, port: number, host?: string): Promise<void> {
   });
 }
 
+// Idempotent: server.close() on an already-closed net.Server calls back
+// with ERR_SERVER_NOT_RUNNING, which would otherwise make this reject.
+// That matters now that closeControl() (below) can close controlServer
+// ahead of close() — close() must still be safe to call afterward (both
+// the shutdown sequence, which does exactly that, and every pre-existing
+// test that just calls close() directly need this to be a harmless no-op
+// the second time).
 function closeServer(server: Server): Promise<void> {
+  if (!server.listening) return Promise.resolve();
   return new Promise((resolve, reject) => {
     server.close((err) => (err ? reject(err) : resolve()));
   });
