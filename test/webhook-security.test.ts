@@ -1,0 +1,80 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHmac } from "node:crypto";
+import { validateTwilioSignature, ReplayCache, publicUrlFor } from "../src/webhook-security.js";
+
+// Computes a Twilio-style signature exactly as Twilio does, independent of
+// the implementation under test. A later task moves this into test/helpers.ts.
+function sign(authToken: string, url: string, params: Record<string, string>): string {
+  const data =
+    url +
+    Object.keys(params)
+      .sort()
+      .map((k) => k + params[k])
+      .join("");
+  return createHmac("sha1", authToken).update(data).digest("base64");
+}
+
+describe("validateTwilioSignature", () => {
+  const authToken = "test-auth-token";
+  const url = "https://x.example/voice/webhook";
+  const params = { CallSid: "CA123", From: "+15550001111", To: "+15550002222" };
+
+  it("accepts a valid signature", () => {
+    const signature = sign(authToken, url, params);
+    expect(validateTwilioSignature({ authToken, signature, url, params })).toBe(true);
+  });
+
+  it("rejects a tampered param", () => {
+    const signature = sign(authToken, url, params);
+    const tampered = { ...params, From: "+15559999999" };
+    expect(validateTwilioSignature({ authToken, signature, url, params: tampered })).toBe(false);
+  });
+
+  it("rejects a missing signature", () => {
+    expect(validateTwilioSignature({ authToken, signature: undefined, url, params })).toBe(false);
+  });
+});
+
+describe("ReplayCache", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns false the first time a key is seen, then true for the same key", () => {
+    const cache = new ReplayCache();
+    expect(cache.seen("key-1")).toBe(false);
+    expect(cache.seen("key-1")).toBe(true);
+  });
+
+  it("returns false again after the ttl elapses", () => {
+    const cache = new ReplayCache(5 * 60 * 1000);
+    expect(cache.seen("key-1")).toBe(false);
+    expect(cache.seen("key-1")).toBe(true);
+    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+    expect(cache.seen("key-1")).toBe(false);
+  });
+});
+
+describe("publicUrlFor", () => {
+  it("joins a trailing-slash base URL and a leading-slash path without a double slash", () => {
+    expect(publicUrlFor("https://x.example/", "/voice/webhook")).toBe(
+      "https://x.example/voice/webhook"
+    );
+  });
+
+  it("joins cleanly regardless of slash presence on either side", () => {
+    expect(publicUrlFor("https://x.example", "/voice/webhook")).toBe(
+      "https://x.example/voice/webhook"
+    );
+    expect(publicUrlFor("https://x.example", "voice/webhook")).toBe(
+      "https://x.example/voice/webhook"
+    );
+    expect(publicUrlFor("https://x.example/", "voice/webhook")).toBe(
+      "https://x.example/voice/webhook"
+    );
+  });
+});
