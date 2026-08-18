@@ -1,18 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createHmac } from "node:crypto";
 import { validateTwilioSignature, ReplayCache, publicUrlFor } from "../src/webhook-security.js";
-
-// Computes a Twilio-style signature exactly as Twilio does, independent of
-// the implementation under test. A later task moves this into test/helpers.ts.
-function sign(authToken: string, url: string, params: Record<string, string>): string {
-  const data =
-    url +
-    Object.keys(params)
-      .sort()
-      .map((k) => k + params[k])
-      .join("");
-  return createHmac("sha1", authToken).update(data).digest("base64");
-}
+import { sign } from "./helpers.js";
 
 describe("validateTwilioSignature", () => {
   const authToken = "test-auth-token";
