@@ -45,11 +45,28 @@ export class MediaStreamConnection {
   // Pending waitForPlayoutDrained() calls, keyed by the mark name Twilio is
   // expected to echo back once playback reaches it.
   private readonly markWaiters = new Map<string, () => void>();
+  // Guards onStop so it fires exactly once, however the connection ends: a
+  // `stop` frame, a clean `close`, or an `error`. Twilio doesn't always
+  // send `stop` before the socket goes away, and a `stop` frame is
+  // typically followed moments later by the socket actually closing — both
+  // must not fire onStop twice for the same call.
+  private stopped = false;
 
   constructor(socket: WebSocket, handlers: MediaStreamHandlers) {
     this.socket = socket;
     this.handlers = handlers;
     this.socket.on("message", (data: Buffer) => this.handleMessage(data));
+    // A socket-level failure or abrupt disconnect (ECONNRESET, the
+    // callee's network dying mid-call, etc.) can arrive as 'close',
+    // 'error', or both — Twilio doesn't guarantee a `stop` frame first.
+    // Without an 'error' listener, Node's EventEmitter treats an
+    // unlistened 'error' as a special case: it throws synchronously and
+    // takes the whole process down. Without a 'close' listener, a drain
+    // already in progress would ride out its full timeout waiting for an
+    // echo that a dead socket can never deliver, and the controller would
+    // never learn the call ended.
+    this.socket.on("close", () => this.handleTermination());
+    this.socket.on("error", () => this.handleTermination());
   }
 
   get streamSid(): string | undefined {
@@ -58,6 +75,7 @@ export class MediaStreamConnection {
 
   /** AI -> caller: send a decoded mu-law Buffer as a Twilio media frame. */
   sendAudio(mulaw: Buffer): void {
+    if (!this.canSend()) return;
     this.sendFrame({
       event: "media",
       streamSid: this._streamSid,
@@ -67,6 +85,7 @@ export class MediaStreamConnection {
 
   /** Flush Twilio's playback buffer (barge-in). */
   sendClear(): void {
+    if (!this.canSend()) return;
     this.sendFrame({ event: "clear", streamSid: this._streamSid });
   }
 
@@ -75,9 +94,13 @@ export class MediaStreamConnection {
    * out. Sends a uniquely-named Twilio mark and resolves once Twilio
    * echoes that same mark name back in a `mark` event. If the echo never
    * arrives within timeoutMs (default 10s), resolves anyway — never
-   * rejects — so a hangup path waiting on this can never wedge.
+   * rejects — so a hangup path waiting on this can never wedge. Resolves
+   * immediately, without sending anything, before a `start` frame has set
+   * streamSid or after the connection has already ended — there is no one
+   * left to ever echo a mark back.
    */
   async waitForPlayoutDrained(timeoutMs = DEFAULT_DRAIN_TIMEOUT_MS): Promise<void> {
+    if (!this.canSend()) return;
     const name = `drain-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
     return new Promise<void>((resolve) => {
@@ -98,6 +121,18 @@ export class MediaStreamConnection {
 
   close(): void {
     this.socket.close();
+  }
+
+  /**
+   * Before Twilio's `start` frame arrives there is no streamSid to stamp
+   * outgoing frames with — JSON.stringify would silently drop the key,
+   * producing a frame Twilio can't route (audio would vanish, a drain
+   * would degrade into a full timeout). Once the connection has already
+   * ended (handleTermination ran), there's equally no peer left to receive
+   * anything or ever echo a mark back.
+   */
+  private canSend(): boolean {
+    return this._streamSid !== undefined && !this.stopped;
   }
 
   private handleMessage(data: Buffer): void {
@@ -126,10 +161,30 @@ export class MediaStreamConnection {
         }
         break;
       case "stop":
-        this.handlers.onStop();
+        this.fireStopOnce();
         break;
       // "connected" and anything else Twilio might send: no-op.
     }
+  }
+
+  /**
+   * Runs on the socket's 'close' or 'error' event: unblocks any pending
+   * waitForPlayoutDrained() calls immediately rather than letting them
+   * ride out their timeout against a socket that can never deliver the
+   * echo, and reports call termination via onStop.
+   */
+  private handleTermination(): void {
+    for (const waiter of this.markWaiters.values()) {
+      waiter();
+    }
+    this.markWaiters.clear();
+    this.fireStopOnce();
+  }
+
+  private fireStopOnce(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.handlers.onStop();
   }
 
   private resolveMarkWaiter(name: string): void {
