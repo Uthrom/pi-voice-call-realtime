@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { WebSocketServer, WebSocket } from "ws";
+import { createServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import { RealtimeSession } from "../src/realtime.js";
 import type { RealtimeCallbacks, RealtimeToolDef } from "../src/realtime.js";
@@ -332,6 +333,52 @@ describe("RealtimeSession", () => {
     await withTimeout(serverClosed.promise, 500, undefined);
 
     expect(serverSawClose).toBe(true);
+  });
+
+  it("ack-timeout teardown does not crash the process when the WS handshake is still pending (round-3 regression)", async () => {
+    // A raw TCP server that accepts the connection but never responds to
+    // the WebSocket upgrade request at all — the client's `ws` socket is
+    // stuck in CONNECTING when the ack timeout fires, which is exactly the
+    // state where terminate() schedules a deferred 'error' emission
+    // (abortHandshake, via process.nextTick) that removeAllListeners()
+    // alone leaves nowhere to land.
+    let serverSideSocket: import("node:net").Socket | undefined;
+    const rawServer = createServer((socket) => {
+      serverSideSocket = socket;
+      socket.on("error", () => {});
+      // Deliberately never write an HTTP response — no upgrade, ever.
+    });
+    await new Promise<void>((resolve) => rawServer.listen(0, "127.0.0.1", () => resolve()));
+    const port = (rawServer.address() as AddressInfo).port;
+    const url = `ws://127.0.0.1:${port}`;
+
+    const session = new RealtimeSession({
+      apiKey: TEST_API_KEY,
+      model: "gpt-realtime",
+      voice: "alloy",
+      instructions: "hi",
+      tools: [],
+      callbacks: NOOP_CALLBACKS,
+      urlOverride: url,
+      connectTimeoutMs: 40
+    });
+
+    await expect(session.connect()).rejects.toThrow(/timed out/i);
+
+    // Reaching this line at all — and this assertion passing — is itself
+    // the evidence: an uncaught 'error' thrown from teardownSocket's
+    // terminate() call would have crashed the process before either could
+    // run.
+    expect(session.ended).toBe(false);
+
+    // Cleanup only — unrelated to the fix under test. abortHandshake's
+    // client-side req.abort()/socket.destroy() doesn't reliably propagate
+    // a close to a raw (non-ws) TCP peer that never completed the HTTP
+    // upgrade, so rawServer.close() alone can hang waiting for a
+    // connection that will never drain on its own; destroy the
+    // server-side socket directly instead.
+    serverSideSocket?.destroy();
+    await new Promise<void>((resolve) => rawServer.close(() => resolve()));
   });
 
   it("a stale socket rejected via an error event cannot mutate a subsequently succeeded connection (round-2 regression)", async () => {

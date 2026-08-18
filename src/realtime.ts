@@ -389,6 +389,12 @@ export class RealtimeSession {
 
   private teardownSocket(ws: WebSocket): void {
     ws.removeAllListeners();
+    // terminate() on a still-CONNECTING socket calls abortHandshake, which
+    // schedules an 'error' emission on process.nextTick — after the
+    // removeAllListeners() above has stripped every listener, an unhandled
+    // 'error' event throws and crashes the process. Retain a no-op error
+    // listener so that deferred emission has somewhere to land.
+    ws.on("error", () => {});
     ws.terminate();
   }
 
