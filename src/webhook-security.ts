@@ -45,6 +45,11 @@ function timingSafeEqualStrings(a: string, b: string): boolean {
   return timingSafeEqual(bufA, bufB);
 }
 
+// Hard cap on cache size. TTL expiry alone only reclaims a key when it is
+// re-queried, so a key inserted once and never queried again would live
+// forever; this bounds memory even under sustained insert-only traffic.
+const MAX_ENTRIES = 1000;
+
 /**
  * Dedupe repeated webhook deliveries (Twilio retries a webhook on timeout or
  * a non-2xx response, which would otherwise replay side effects).
@@ -57,7 +62,15 @@ export class ReplayCache {
     this.ttlMs = ttlMs;
   }
 
-  /** True if already seen (and marks it either way). */
+  /**
+   * True if already seen (and marks it either way).
+   *
+   * SECURITY: only call this after `validateTwilioSignature` has returned
+   * true. `seen()` unconditionally inserts the key, so calling it on
+   * unauthenticated requests lets anyone who can reach the public endpoint
+   * grow the cache at request rate — the size cap below limits the damage,
+   * but authenticate first regardless.
+   */
   seen(key: string): boolean {
     const now = Date.now();
     const expiresAt = this.seenUntil.get(key);
@@ -69,6 +82,12 @@ export class ReplayCache {
     }
 
     this.seenUntil.set(key, now + this.ttlMs);
+    if (this.seenUntil.size > MAX_ENTRIES) {
+      const oldest = this.seenUntil.keys().next().value;
+      if (oldest !== undefined) {
+        this.seenUntil.delete(oldest);
+      }
+    }
     return false;
   }
 }

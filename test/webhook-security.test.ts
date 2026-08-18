@@ -33,6 +33,36 @@ describe("validateTwilioSignature", () => {
   it("rejects a missing signature", () => {
     expect(validateTwilioSignature({ authToken, signature: undefined, url, params })).toBe(false);
   });
+
+  // Independent conformance anchor: this fixture is Twilio's own, taken
+  // verbatim from twilio-python's RequestValidator test suite
+  // (tests/unit/test_request_validator.py in twilio/twilio-python), not
+  // derived from the `sign()` helper above. It pins this implementation to
+  // Twilio's published algorithm rather than to this test file's own math,
+  // so a shared porting bug in both `sign()` and the implementation (e.g.
+  // wrong join separator, wrong sort, wrong digest encoding) would still
+  // be caught.
+  it("accepts Twilio's documented request-validation test vector", () => {
+    const twilioAuthToken = "12345";
+    const twilioUrl = "https://mycompany.com/myapp.php?foo=1&bar=2";
+    const twilioParams = {
+      CallSid: "CA1234567890ABCDE",
+      Digits: "1234",
+      From: "+14158675309",
+      To: "+18005551212",
+      Caller: "+14158675309"
+    };
+    const twilioSignature = "RSOYDt4T1cUTdK1PDd93/VVr8B8=";
+
+    expect(
+      validateTwilioSignature({
+        authToken: twilioAuthToken,
+        signature: twilioSignature,
+        url: twilioUrl,
+        params: twilioParams
+      })
+    ).toBe(true);
+  });
 });
 
 describe("ReplayCache", () => {
@@ -56,6 +86,21 @@ describe("ReplayCache", () => {
     expect(cache.seen("key-1")).toBe(true);
     vi.advanceTimersByTime(5 * 60 * 1000 + 1);
     expect(cache.seen("key-1")).toBe(false);
+  });
+
+  it("caps its size, evicting the oldest key so the newest is retained", () => {
+    const cache = new ReplayCache();
+    const MAX_ENTRIES = 1000; // mirrors ReplayCache's internal cap
+
+    for (let i = 0; i <= MAX_ENTRIES; i++) {
+      cache.seen(`key-${i}`);
+    }
+
+    // The oldest key was evicted to keep the cache bounded: re-querying it
+    // looks unseen (inserted anew) rather than already-seen.
+    expect(cache.seen("key-0")).toBe(false);
+    // The newest key survived the cap.
+    expect(cache.seen(`key-${MAX_ENTRIES}`)).toBe(true);
   });
 });
 
