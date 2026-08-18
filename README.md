@@ -85,7 +85,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 Notes:
 - `twilio.accountSid` / `twilio.authToken` and `openai.apiKey` can instead be supplied via env vars `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `OPENAI_API_KEY`, which override the file when set to a non-empty value.
 - `serve.tunnel` can be `"cloudflared"` (default), `"ngrok"`, or `"none"` (in which case set `serve.publicUrl` to a static HTTPS URL you manage yourself, e.g. a reverse proxy).
-- **Quick tunnels can be unreliable — a named Cloudflare Tunnel is strongly recommended for real use.** On some networks, trycloudflare quick tunnels intermittently 502 webhooks and break WebSocket upgrades entirely (observed live; Twilio errors 15003/31920 — the call answers and immediately drops). If you have a domain on Cloudflare, set up a permanent tunnel once:
+- **The zero-setup default (`"cloudflared"` quick tunnel) works.** One machine-local gotcha: your OS resolver can negative-cache a fresh trycloudflare hostname before its DNS record lands, making the tunnel look dead *from the machine running it* while Twilio (which uses its own resolvers) reaches it fine. The daemon's boot-time readiness probe therefore resolves via public DNS (1.1.1.1/8.8.8.8) and prints `tunnel verified reachable` on success; if you see the probe-timeout warning instead, the tunnel may still be fine — but a daemon restart gets you a fresh hostname if calls fail. For an always-stable URL that survives restarts, a named Cloudflare Tunnel (needs a domain on Cloudflare) is a nice upgrade:
   ```bash
   cloudflared tunnel login                       # pick your zone in the browser
   cloudflared tunnel create pi-voice

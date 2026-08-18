@@ -1,5 +1,8 @@
 import { createServer } from "node:http";
 import type { Server } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { Resolver as DnsResolver, lookup as dnsLookup } from "node:dns";
+import type { LookupFunction } from "node:net";
 import type { AddressInfo } from "node:net";
 import { URL, pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
@@ -600,16 +603,80 @@ export async function startServer(
  * error and then hang forever instead of actually exiting.
  */
 /**
+ * One readiness probe against `${publicUrl}/voice/webhook`, resolving the
+ * hostname via PUBLIC resolvers (1.1.1.1 / 8.8.8.8) with the system
+ * resolver only as fallback. The local resolver is the one party this
+ * probe must not trust: fresh trycloudflare hostnames get negative-cached
+ * by the OS before their DNS records land (observed live 2026-08-18 — the
+ * hostname resolved fine on 1.1.1.1 and routed end-to-end via --resolve
+ * while the local resolver returned nothing for minutes), and Twilio
+ * resolves via its own DNS, so a locally-invisible tunnel can be perfectly
+ * reachable from the internet. Returns the HTTP status, or null on any
+ * failure.
+ */
+function probeTunnelOnce(publicUrl: string, timeoutMs: number): Promise<number | null> {
+  return new Promise((resolve) => {
+    let u: URL;
+    try {
+      u = new URL(`${publicUrl}/voice/webhook`);
+    } catch {
+      resolve(null);
+      return;
+    }
+    const resolver = new DnsResolver();
+    resolver.setServers(["1.1.1.1", "8.8.8.8"]);
+    const lookup: LookupFunction = (hostname, options, callback) => {
+      resolver.resolve4(hostname, (err, addresses) => {
+        if (!err && addresses.length > 0) {
+          if (typeof options === "object" && options.all) {
+            callback(null, addresses.map((address) => ({ address, family: 4 })));
+          } else {
+            (callback as (e: NodeJS.ErrnoException | null, a: string, f: number) => void)(
+              null,
+              addresses[0]!,
+              4
+            );
+          }
+        } else if (typeof options === "object" && options.all) {
+          dnsLookup(
+            hostname,
+            { all: true },
+            callback as (e: NodeJS.ErrnoException | null, a: { address: string; family: number }[]) => void
+          );
+        } else {
+          dnsLookup(
+            hostname,
+            callback as (e: NodeJS.ErrnoException | null, a: string, f: number) => void
+          );
+        }
+      });
+    };
+    const req = httpsRequest(
+      { hostname: u.hostname, port: u.port || 443, path: u.pathname, method: "GET", lookup, timeout: timeoutMs },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode ?? null);
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.on("error", () => resolve(null));
+    req.end();
+  });
+}
+
+/**
  * Probe the public URL through the tunnel edge until OUR server answers.
  * Fresh trycloudflare quick tunnels take several seconds to propagate; in
- * that window the edge returns 502 (and WSS upgrades fail with Twilio error
- * 31920) even though cloudflared has already printed the URL — observed live
- * on 2026-08-18: a call placed ~45s after boot lost its answer-webhook
- * media stream and its AMD callback to exactly this. Success = HTTP 404,
- * the one status only our public handler returns for GET /voice/webhook
- * (edge failures return 5xx; a signature-gated POST would be 403).
- * On timeout we warn and continue — a static publicUrl behind a firewall
- * that drops GETs must not brick startup.
+ * that window the edge returns 502 even though cloudflared has already
+ * printed the URL. Success = HTTP 404, the one status only our public
+ * handler returns for GET /voice/webhook (edge failures return 5xx; a
+ * signature-gated POST would be 403). On timeout we warn and continue —
+ * a static publicUrl behind a firewall that drops GETs must not brick
+ * startup, and (see probeTunnelOnce) a locally-unresolvable hostname can
+ * still be reachable from Twilio.
  */
 export async function waitForTunnelReady(
   publicUrl: string,
@@ -617,18 +684,24 @@ export async function waitForTunnelReady(
 ): Promise<boolean> {
   const timeoutMs = opts?.timeoutMs ?? 30_000;
   const intervalMs = opts?.intervalMs ?? 1_000;
-  const fetchFn = opts?.fetchImpl ?? fetch;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    try {
-      const res = await fetchFn(`${publicUrl}/voice/webhook`, {
-        method: "GET",
-        signal: AbortSignal.timeout(Math.min(intervalMs * 2, 5_000))
-      });
-      if (res.status === 404) return true;
-    } catch {
-      // Edge not routable yet (DNS, connect, or timeout) — keep polling.
+    let status: number | null;
+    if (opts?.fetchImpl) {
+      // Test seam: injected fetch stands in for the whole HTTPS+DNS stack.
+      try {
+        const res = await opts.fetchImpl(`${publicUrl}/voice/webhook`, {
+          method: "GET",
+          signal: AbortSignal.timeout(Math.min(intervalMs * 2, 5_000))
+        });
+        status = res.status;
+      } catch {
+        status = null;
+      }
+    } else {
+      status = await probeTunnelOnce(publicUrl, Math.min(intervalMs * 2, 5_000));
     }
+    if (status === 404) return true;
     if (Date.now() >= deadline) {
       console.warn(
         `[server] tunnel readiness probe timed out after ${timeoutMs}ms — ` +
