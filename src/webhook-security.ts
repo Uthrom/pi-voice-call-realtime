@@ -63,7 +63,11 @@ export class ReplayCache {
   }
 
   /**
-   * True if already seen (and marks it either way).
+   * True if already seen (and marks it either way) — `has()` + `mark()` in
+   * one atomic call. Kept for callers (and tests) that want the combined
+   * check-and-insert; webhook.ts itself uses `has()`/`mark()` separately so
+   * it can defer the insert until a side-effecting handler actually
+   * succeeds — see `mark()`'s doc comment.
    *
    * SECURITY: only call this after `validateTwilioSignature` has returned
    * true. `seen()` unconditionally inserts the key, so calling it on
@@ -72,6 +76,19 @@ export class ReplayCache {
    * but authenticate first regardless.
    */
   seen(key: string): boolean {
+    if (this.has(key)) return true;
+    this.mark(key);
+    return false;
+  }
+
+  /**
+   * Peek only: true if `key` is currently within its TTL window. Does NOT
+   * insert or extend anything — an expired entry is still purged as a
+   * housekeeping side effect of the lookup. Pairs with `mark()` so a caller
+   * can check for a replay before doing side-effecting work, and only
+   * commit the key once that work has actually succeeded.
+   */
+  has(key: string): boolean {
     const now = Date.now();
     const expiresAt = this.seenUntil.get(key);
     if (expiresAt !== undefined) {
@@ -80,15 +97,34 @@ export class ReplayCache {
       }
       this.seenUntil.delete(key);
     }
+    return false;
+  }
 
-    this.seenUntil.set(key, now + this.ttlMs);
+  /**
+   * Unconditionally (re)inserts `key` with a fresh TTL.
+   *
+   * SECURITY: same ordering requirement as `has()`/`seen()` — only call
+   * after `validateTwilioSignature` has returned true.
+   *
+   * ORDERING (webhook.ts Finding 1): for a side-effecting request
+   * (kind=status/kind=amd), webhook.ts calls this only AFTER
+   * `manager.handleProviderEvent` has resolved successfully — never
+   * upfront. Marking the key before the handler runs would mean: a
+   * transient handler failure (e.g. `CallStore.save()` rejecting) 500s this
+   * delivery, but the key is already recorded as seen, so Twilio's
+   * automatic retry of the byte-identical request is deduped into a no-op
+   * 200 and the state transition that delivery carried is lost forever —
+   * for a pre-answer terminal callback (no-answer/busy) permanently, since
+   * no duration timer exists yet to un-wedge the single call slot.
+   */
+  mark(key: string): void {
+    this.seenUntil.set(key, Date.now() + this.ttlMs);
     if (this.seenUntil.size > MAX_ENTRIES) {
       const oldest = this.seenUntil.keys().next().value;
       if (oldest !== undefined) {
         this.seenUntil.delete(oldest);
       }
     }
-    return false;
   }
 }
 

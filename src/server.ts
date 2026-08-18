@@ -21,6 +21,7 @@ import type { CallRecord } from "./types.js";
 import { TERMINAL_STATUSES } from "./types.js";
 import { resolvePublicUrl } from "./tunnel.js";
 import type { Tunnel } from "./tunnel.js";
+import { createReaper } from "./reaper.js";
 
 const STREAM_PATH = "/voice/stream";
 
@@ -183,6 +184,22 @@ export async function startServer(
     urls,
     fromNumber: cfg.twilio.fromNumber
   });
+
+  // Finding 2: reconcile any call left non-terminal on disk by a previous
+  // process instance (crash, kill -9, a shutdown-drain that itself timed
+  // out) — see reaper.ts's own doc comment for the full rationale. The
+  // one-shot startup sweep runs (and is awaited) before the daemon is
+  // wired to serve any traffic; the periodic sweep then runs every 60s for
+  // the life of the process, guarded so it can never touch a call this
+  // process is actually still running.
+  const reaper = createReaper({
+    store,
+    provider,
+    maxDurationSec: cfg.limits.maxDurationSec,
+    hasActiveSession: (id) => manager.getActive()?.id === id
+  });
+  await reaper.sweepOnStartup();
+  reaper.start();
 
   const realtimeFactory =
     overrides?.realtimeFactory ??
@@ -361,7 +378,10 @@ export async function startServer(
     // orphan a live, unclosable public listener with a wired CallManager.
     // Close it before propagating the failure so a caller that catches
     // startServer's rejection isn't left with a leaked listener they have
-    // no handle to.
+    // no handle to. reaper.start() (above) already armed its periodic
+    // timer — stop it too, or it would keep firing against a store/provider
+    // this failed startServer() call is otherwise abandoning.
+    reaper.stop();
     await Promise.all([closeWss(wss), closeServer(publicServer)]).catch(() => {
       // Best-effort: publicServer is already being torn down; a failure
       // here must not mask the real error below.
@@ -508,6 +528,12 @@ export async function startServer(
     drainActiveSession,
     closeControl,
     async close() {
+      // Disarm the periodic reaper sweep first — it's unref'd so it can't
+      // keep the process alive on its own, but leaving it armed past
+      // close() would mean a stray sweep could still write to `store` (and
+      // call the now-possibly-torn-down `provider`) after this handle is
+      // considered fully shut down.
+      reaper.stop();
       // wss (noServer: true) has no listening socket of its own — closing
       // it only waits for its tracked clients to disconnect, and it never
       // terminates them itself. Without explicitly terminating them first,

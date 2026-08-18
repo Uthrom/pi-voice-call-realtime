@@ -376,4 +376,24 @@ describe("CallManager", () => {
     expect(rec.amdResult).toBe("machine");
     expect(result).toBe("machine");
   });
+
+  it("Finding 2 (promoted): completed with an unrecognized providerStatus finalizes as failed, with a warn, instead of staying non-terminal forever", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { manager, store } = makeManager();
+    const rec = await manager.initiateCall(makeParams());
+
+    await manager.handleProviderEvent({
+      type: "completed",
+      providerCallId: "CA1",
+      providerStatus: "some-bogus-status"
+    });
+
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+
+    const saved = await store.get(rec.id);
+    expect(saved?.status).toBe("failed");
+    expect(saved?.endedAt).toBeTruthy();
+    expect(manager.getActive()).toBeUndefined();
+  });
 });

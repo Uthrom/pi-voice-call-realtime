@@ -154,7 +154,7 @@ export class VoiceBridgeClient {
     }
   }
 
-  /** `callId` given → GET /calls/:id. Omitted → GET /calls/active ("most recent" per spec §2.2). */
+  /** `callId` given → GET /calls/:id. Omitted → GET /calls/active, which returns the currently active call, or — once nothing is active — the most recently completed one (spec §2.2: "active/most recent"). */
   async getStatus(callId?: string): Promise<CallRecordLike | undefined> {
     const path = callId ? `/calls/${callId}` : "/calls/active";
     const res = await this.request("GET", path);

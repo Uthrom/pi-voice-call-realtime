@@ -72,9 +72,18 @@ export function createPublicHandler(deps: {
       // to protect — deduping it would risk swallowing a legitimate Twilio
       // retry of the answer webhook into an empty 200 with no TwiML, which
       // would break the call. So it's deliberately excluded here.
+      //
+      // The key is only PEEKED here (has()) — it's MARKED (below) only once
+      // the handler has actually completed successfully. Marking upfront
+      // would mean a transient handler failure (e.g. CallStore.save()
+      // rejecting) 500s this delivery while the key is already recorded as
+      // seen, so Twilio's automatic retry of the byte-identical request
+      // gets deduped into a no-op 200 and the transition is lost forever —
+      // see ReplayCache.mark()'s doc comment (webhook-security.ts).
+      let replayKey: string | undefined;
       if (kind !== "answer") {
-        const replayKey = `${signature}:${params.CallSid ?? ""}:${params.CallStatus ?? ""}`;
-        if (replay.seen(replayKey)) {
+        replayKey = `${signature}:${params.CallSid ?? ""}:${params.CallStatus ?? ""}`;
+        if (replay.has(replayKey)) {
           send(res, 200);
           return;
         }
@@ -86,10 +95,13 @@ export function createPublicHandler(deps: {
       }
       if (kind === "status") {
         await handleStatus(manager, params);
-        send(res, 200);
-        return;
+      } else {
+        await handleAmd(manager, params);
       }
-      await handleAmd(manager, params);
+      // Only reached once the handler above resolved without throwing.
+      if (replayKey !== undefined) {
+        replay.mark(replayKey);
+      }
       send(res, 200);
     } catch (err) {
       // Ordinary disk I/O (ENOSPC, EACCES, a corrupt JSON record) can reject

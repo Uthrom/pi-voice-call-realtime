@@ -64,7 +64,7 @@ export function createControlHandler(
       }
 
       if (req.method === "GET" && segments.length === 2 && segments[0] === "calls" && segments[1] === "active") {
-        handleActive(res, manager);
+        await handleActive(res, manager, store);
         return;
       }
 
@@ -163,13 +163,25 @@ async function handleInitiate(
   }
 }
 
-function handleActive(res: ServerResponse, manager: CallManager): void {
+// Finding 3 (spec §2.2: "Current state of active/most recent call."): when
+// nothing is active in this process, fall back to the most recent record on
+// disk — the manager's in-memory `active` slot is empty between calls
+// (and, notably, after every restart) even though the daemon has plainly
+// handled a call before. Only a genuinely empty store still 204s.
+async function handleActive(res: ServerResponse, manager: CallManager, store: CallStore): Promise<void> {
   const active = manager.getActive();
-  if (!active) {
+  if (active) {
+    sendJson(res, 200, active);
+    return;
+  }
+
+  const list = await store.list(); // already newest-first (CallStore.list's own sort)
+  const mostRecent = list[0];
+  if (!mostRecent) {
     send(res, 204);
     return;
   }
-  sendJson(res, 200, active);
+  sendJson(res, 200, mostRecent);
 }
 
 async function handleGetById(id: string, res: ServerResponse, store: CallStore): Promise<void> {

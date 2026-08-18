@@ -282,6 +282,30 @@ describe("control API", () => {
       const body = (await res.json()) as CallRecord;
       expect(body.id).toBe(rec.id);
     });
+
+    it("Finding 3: falls back to the most recent record once the call has completed and nothing is active", async () => {
+      const { baseUrl, handle: h } = await boot();
+      const rec = await h.manager.initiateCall({
+        to: "+15551234567",
+        objective: "confirm appointment",
+        talkingPoints: [],
+        callerIdentity: "pi"
+      });
+      await h.manager.endCall(rec.id, "operator");
+      expect(h.manager.getActive()).toBeUndefined();
+
+      const res = await fetch(`${baseUrl}/calls/active`, { headers: authed() });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as CallRecord;
+      expect(body.id).toBe(rec.id);
+      expect(body.status).toBe("completed");
+    });
+
+    it("Finding 3: still returns 204 when the store is genuinely empty (never active, never any completed call)", async () => {
+      const { baseUrl } = await boot();
+      const res = await fetch(`${baseUrl}/calls/active`, { headers: authed() });
+      expect(res.status).toBe(204);
+    });
   });
 
   describe("GET /calls/:id/transcript", () => {

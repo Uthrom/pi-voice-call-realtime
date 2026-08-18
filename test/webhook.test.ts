@@ -446,6 +446,47 @@ describe("public webhook server", () => {
     10000
   );
 
+  it(
+    "Finding 1: a transient store failure on first delivery does not poison the replay cache — the exact same retried delivery is genuinely reprocessed",
+    async () => {
+      const store = new FlakyStore(tempHome());
+      const provider = new MockProvider();
+      const h = await startServer(makeConfig(tempHome()), { store, provider });
+      handle = h;
+      const port = (h.publicServer.address() as AddressInfo).port;
+      const baseUrl = `http://127.0.0.1:${port}`;
+
+      const rec = await h.manager.initiateCall({
+        to: "+15551234567",
+        objective: "confirm appointment",
+        talkingPoints: ["confirm time"],
+        callerIdentity: "pi"
+      });
+
+      // Identical params on both requests, signed identically each time
+      // (postSigned recomputes the signature from the same url+params) —
+      // this is exactly what Twilio's automatic retry of a non-2xx
+      // delivery looks like on the wire: byte-identical body + signature.
+      const params = callParams({ CallSid: rec.providerCallId!, CallStatus: "in-progress" });
+
+      store.armFailure();
+      const first = await postSigned(baseUrl, "/voice/webhook?kind=status", params);
+      expect(first.status).toBe(500);
+      // The transition must not have applied — the failed write never landed.
+      expect(h.manager.getActive()?.status).toBe("dialing");
+
+      const retry = await postSigned(baseUrl, "/voice/webhook?kind=status", params);
+      expect(retry.status).toBe(200);
+      // If the first (failed) delivery had already marked the replay key as
+      // seen, this retry would be deduped into a no-op 200 and the
+      // transition would be lost forever — asserting it actually applied is
+      // the whole point of this test.
+      expect(h.manager.getActive()?.status).toBe("answered");
+      expect(h.manager.getActive()?.answeredAt).toBeTruthy();
+    },
+    10000
+  );
+
   it("a control-server bind failure rejects startServer and releases the public port", async () => {
     const occupied = await getFreePort();
     const occupier = await occupyPort(occupied);

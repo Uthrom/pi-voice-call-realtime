@@ -304,7 +304,14 @@ export class CallManager extends EventEmitter {
     }
     const mapped = COMPLETED_STATUS_MAP[providerStatus];
     if (!mapped) {
-      this.warnIgnored("completed", rec.providerCallId ?? rec.id, `unrecognized providerStatus "${providerStatus}"`);
+      // An unrecognized providerStatus used to be silently ignored, leaving
+      // the record wedged non-terminal forever (and, while it was `active`,
+      // permanently occupying the single call slot with no timer to ever
+      // un-wedge it). Finalizing as "failed" guarantees forward progress.
+      console.warn(
+        `[CallManager] unrecognized providerStatus "${providerStatus}" for call ${rec.id} (${rec.providerCallId ?? "no providerCallId"}) — finalizing as failed`
+      );
+      await this.finalizeInternal(rec.id, "failed", { error: `unrecognized providerStatus "${providerStatus}"` });
       return;
     }
     await this.finalizeInternal(rec.id, mapped);
