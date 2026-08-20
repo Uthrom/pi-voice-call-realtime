@@ -60,7 +60,7 @@ function makeConfig(home: string): Config {
     home,
     twilio: { accountSid: "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", authToken: AUTH_TOKEN, fromNumber: "+15559998888" },
     openai: { apiKey: "sk-test", realtimeModel: "gpt-realtime", voice: "alloy" },
-    summaryModel: "gpt-4o-mini",
+    summary: { model: "gpt-4o-mini", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test" },
     serve: { controlPort: 0, publicPort: 0, tunnel: "none", controlToken: "control-secret" },
     limits: { maxDurationSec: 900, maxConcurrentCalls: 1, dailyCallCap: 20 },
     defaults: { callerIdentity: "pi", amdPolicy: "leave-message" }

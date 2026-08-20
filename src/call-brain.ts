@@ -37,6 +37,17 @@ export function buildInstructions(params: CallParams, opts?: { voicemail?: boole
   lines.push("Behavior rules:");
   lines.push("- Speak in concise, natural spoken sentences.");
   lines.push("- Never invent commitments beyond the stated objective.");
+  // Preamble guards for the 2.1 reasoning realtime models, which otherwise
+  // narrate their planning ("let me think about the next steps") and
+  // internal capabilities ("I don't have a booking tool") to the callee.
+  // Phrasing follows OpenAI's realtime prompting guide: describe the
+  // action, not the internal reasoning. Harmless no-ops on pre-2.1 models.
+  lines.push(
+    "- Everything you say is heard by the person on the phone. Never narrate your internal reasoning, planning, or next steps aloud."
+  );
+  lines.push(
+    "- Never mention tools, systems, or capabilities you have or lack. If you need a moment, say one short natural sentence describing what you are doing — never why or how you are deciding."
+  );
   // The next three rules all presuppose a live back-and-forth (being asked
   // a question, the other party losing interest, a conversational moment
   // where the objective resolves) — none of that applies to a one-way

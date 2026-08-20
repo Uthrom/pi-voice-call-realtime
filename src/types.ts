@@ -1,3 +1,7 @@
+// Realtime reasoning-effort levels (2.1+ models); pre-2.1 realtime models
+// reject the session field entirely, so it is only sent when configured.
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export type CallStatus =
   | "queued"
   | "dialing"

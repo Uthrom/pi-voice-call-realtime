@@ -39,7 +39,7 @@ function makeConfig(home: string): Config {
     home,
     twilio: { accountSid: "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", authToken: AUTH_TOKEN, fromNumber: "+15559998888" },
     openai: { apiKey: "sk-super-secret-openai-key", realtimeModel: "gpt-realtime", voice: "alloy" },
-    summaryModel: "gpt-4o-mini",
+    summary: { model: "gpt-4o-mini", baseUrl: "https://api.openai.com/v1", apiKey: "sk-super-secret-summary-key" },
     serve: {
       controlPort: 0,
       publicPort: 0,
@@ -271,6 +271,7 @@ describe("formatBanner", () => {
     expect(banner).not.toContain(cfg.serve.controlToken);
     expect(banner).not.toContain(cfg.twilio.authToken);
     expect(banner).not.toContain(cfg.openai.apiKey);
+    expect(banner).not.toContain(cfg.summary.apiKey);
   });
 });
 

@@ -1,6 +1,6 @@
 import type { CallOutcome } from "./types.js";
 
-const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
+const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const MAX_TRANSCRIPT_CHARS = 12_000;
 const HEAD_CHARS = 4_000;
 const TAIL_CHARS = 8_000;
@@ -13,6 +13,7 @@ const SYSTEM_PROMPT =
 export interface SummarizeCallOpts {
   apiKey: string;
   model: string;
+  baseUrl?: string; // any OpenAI-compatible /v1 root; default official OpenAI
   objective: string;
   transcript: string;
   notedOutcome?: CallOutcome;
@@ -47,7 +48,8 @@ export async function summarizeCall(opts: SummarizeCallOpts): Promise<CallSummar
     const truncated = truncateTranscript(opts.transcript);
     const userContent = buildUserContent(opts.objective, truncated, opts.notedOutcome);
 
-    const res = await fetchFn(OPENAI_CHAT_COMPLETIONS_URL, {
+    const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    const res = await fetchFn(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${opts.apiKey}`,

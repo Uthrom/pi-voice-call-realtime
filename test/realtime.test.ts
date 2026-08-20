@@ -98,7 +98,13 @@ function nextClientMessage(socket: WebSocket): Promise<Record<string, unknown> |
 
 async function connectedSession(
   callbacks: Partial<RealtimeCallbacks> = {},
-  opts: Partial<{ instructions: string; tools: RealtimeToolDef[]; voice: string; model: string }> = {}
+  opts: Partial<{
+    instructions: string;
+    tools: RealtimeToolDef[];
+    voice: string;
+    model: string;
+    reasoningEffort: "minimal" | "low" | "medium" | "high" | "xhigh";
+  }> = {}
 ): Promise<{
   session: RealtimeSession;
   socket: WebSocket;
@@ -125,6 +131,7 @@ async function connectedSession(
     voice: opts.voice ?? "alloy",
     instructions: opts.instructions ?? "Base instructions",
     tools: opts.tools ?? TOOLS,
+    reasoningEffort: opts.reasoningEffort,
     callbacks: { ...NOOP_CALLBACKS, ...callbacks },
     urlOverride: url
   });
@@ -204,6 +211,18 @@ describe("RealtimeSession", () => {
         ]
       }
     });
+  });
+
+  it("includes reasoning.effort in session.update when configured", async () => {
+    const { sessionUpdate } = await connectedSession({}, { reasoningEffort: "minimal" });
+    const session = sessionUpdate?.session as Record<string, unknown>;
+    expect(session.reasoning).toEqual({ effort: "minimal" });
+  });
+
+  it("omits the reasoning field entirely when no effort is configured (pre-2.1 models reject unknown params)", async () => {
+    const { sessionUpdate } = await connectedSession({}, {});
+    const session = sessionUpdate?.session as Record<string, unknown>;
+    expect(session).not.toHaveProperty("reasoning");
   });
 
   it("connects with an Authorization: Bearer <apiKey> header, and never leaks the key on a failed connection", async () => {

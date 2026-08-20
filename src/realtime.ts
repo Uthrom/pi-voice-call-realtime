@@ -32,6 +32,7 @@
  */
 
 import { WebSocket } from "ws";
+import type { ReasoningEffort } from "./types.js";
 
 /** Function tool exposed to the realtime model during a call. */
 export interface RealtimeToolDef {
@@ -54,6 +55,10 @@ interface RealtimeSessionOpts {
   voice: string;
   instructions: string;
   tools: RealtimeToolDef[];
+  // 2.1+ reasoning models only — when set, sent as session reasoning.effort.
+  // Omitted from session.update entirely when absent: pre-2.1 realtime
+  // models reject unknown session fields.
+  reasoningEffort?: ReasoningEffort;
   callbacks: RealtimeCallbacks;
   urlOverride?: string;
   // Testability hook — real callers never need this; default matches the
@@ -92,6 +97,7 @@ export class RealtimeSession {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly voice: string;
+  private readonly reasoningEffort: ReasoningEffort | undefined;
   private readonly tools: RealtimeToolDef[];
   private readonly callbacks: RealtimeCallbacks;
   private readonly url: string;
@@ -119,6 +125,7 @@ export class RealtimeSession {
     this.apiKey = opts.apiKey;
     this.model = opts.model;
     this.voice = opts.voice;
+    this.reasoningEffort = opts.reasoningEffort;
     this.instructions = opts.instructions;
     this.tools = opts.tools;
     this.callbacks = opts.callbacks;
@@ -276,6 +283,7 @@ export class RealtimeSession {
           voice: this.voice
         }
       },
+      ...(this.reasoningEffort ? { reasoning: { effort: this.reasoningEffort } } : {}),
       instructions: this.instructions,
       tools: this.tools.map((tool) => ({
         type: "function",

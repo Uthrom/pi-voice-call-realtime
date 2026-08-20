@@ -38,7 +38,7 @@ function baseConfig(overrides: Partial<Config["serve"]> = {}): Config {
     home: "/tmp/pi-voice-test",
     twilio: { accountSid: "ACxxx", authToken: "tok", fromNumber: "+15550001111" },
     openai: { apiKey: "sk-test", realtimeModel: "gpt-realtime", voice: "alloy" },
-    summaryModel: "gpt-4o-mini",
+    summary: { model: "gpt-4o-mini", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test" },
     serve: {
       controlPort: 3335,
       publicPort: 3334,

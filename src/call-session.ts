@@ -170,6 +170,7 @@ export class CallSession {
       apiKey: this.config.openai.apiKey,
       model: this.config.openai.realtimeModel,
       voice: this.record.params.voice ?? this.config.openai.voice,
+      reasoningEffort: this.config.openai.reasoningEffort,
       instructions: buildInstructions(this.record.params),
       tools: inCallTools(),
       callbacks: {
@@ -314,8 +315,9 @@ export class CallSession {
     // summarizeCall never throws (falls back to notedOutcome/"unknown" +
     // an explanatory summary string on any failure) — no try/catch needed.
     const summary = await this.summarize({
-      apiKey: this.config.openai.apiKey,
-      model: this.config.summaryModel,
+      apiKey: this.config.summary.apiKey,
+      model: this.config.summary.model,
+      baseUrl: this.config.summary.baseUrl,
       objective: this.record.params.objective,
       transcript: transcriptText,
       notedOutcome: this.record.outcome

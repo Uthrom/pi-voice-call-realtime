@@ -73,7 +73,10 @@ That minimal file is all you need. Optional settings and their defaults:
 |---|---|---|
 | `openai.realtimeModel` | `"gpt-realtime"` | Voice conversation model |
 | `openai.voice` | `"alloy"` | Realtime voice |
-| `summaryModel` | `"gpt-4o-mini"` | Post-call summary model |
+| `openai.reasoningEffort` | unset | For 2.1+ realtime models: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`. `"minimal"` recommended for phone calls; leave unset on pre-2.1 models (they reject the field) |
+| `summary.model` | `"gpt-4o-mini"` | Post-call summary model |
+| `summary.baseUrl` | `"https://api.openai.com/v1"` | Any OpenAI-compatible chat-completions server |
+| `summary.apiKey` | `openai.apiKey` | Separate key for the summary endpoint |
 | `serve.controlPort` | `3335` | Localhost control API |
 | `serve.publicPort` | `3334` | Webhook/media listener behind the tunnel |
 | `serve.tunnel` | `"cloudflared"` | `"cloudflared"`, `"ngrok"`, or `"none"` (then set `serve.publicUrl`) |
@@ -83,7 +86,19 @@ That minimal file is all you need. Optional settings and their defaults:
 | `defaults.callerIdentity` | `"pi"` | How the agent introduces itself |
 | `defaults.amdPolicy` | `"leave-message"` | Or `"hangup"` when a machine answers |
 
-`twilio.accountSid`, `twilio.authToken`, and `openai.apiKey` can also be supplied via the `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `OPENAI_API_KEY` env vars, which override the file when set to a non-empty value.
+Post-call summaries can run against any OpenAI-compatible endpoint (a local model, a proxy, a free-tier server) instead of OpenAI — for example:
+
+```json
+"summary": {
+  "model": "llama-3.3-70b",
+  "baseUrl": "https://my-llm.example.com/v1",
+  "apiKey": "whatever-your-server-expects"
+}
+```
+
+Omitted fields fall back to the defaults above, so `"summary": { "model": "gpt-5-mini" }` alone is also valid.
+
+`twilio.accountSid`, `twilio.authToken`, `openai.apiKey`, and `summary.apiKey` can also be supplied via the `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `OPENAI_API_KEY`, and `SUMMARY_API_KEY` env vars, which override the file when set to a non-empty value.
 
 ### 3. Run the daemon
 

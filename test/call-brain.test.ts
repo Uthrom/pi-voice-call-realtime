@@ -43,6 +43,21 @@ describe("buildInstructions", () => {
     expect(text).toContain("never invent commitments");
   });
 
+  // The 2.1 realtime models are reasoning models with "spoken preamble"
+  // behavior: left unconstrained they narrate their planning ("let me think
+  // about the next steps") and internal capabilities ("I don't have a
+  // booking tool connected") to the person on the phone. Both variants need
+  // the guard — a voicemail monologue can narrate planning too.
+  it.each([
+    ["conversation", undefined],
+    ["voicemail", { voicemail: true }]
+  ] as const)("forbids narrating internal reasoning or capabilities aloud (%s variant)", (_label, opts) => {
+    const text = buildInstructions(baseParams, opts);
+    expect(text).toContain("Never narrate your internal reasoning");
+    expect(text.toLowerCase()).toContain("heard by the person on the phone");
+    expect(text.toLowerCase()).toContain("never mention tools");
+  });
+
   it("includes the wrap-up-and-end_call rule for an uninterested caller", () => {
     const text = buildInstructions(baseParams);
     expect(text.toLowerCase()).toContain("uninterested");

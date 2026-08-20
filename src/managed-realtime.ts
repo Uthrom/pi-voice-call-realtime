@@ -17,6 +17,7 @@
 
 import { RealtimeSession } from "./realtime.js";
 import type { RealtimeCallbacks, RealtimeToolDef } from "./realtime.js";
+import type { ReasoningEffort } from "./types.js";
 
 interface ManagedRealtimeSessionOpts {
   apiKey: string;
@@ -24,6 +25,9 @@ interface ManagedRealtimeSessionOpts {
   voice: string;
   instructions: string;
   tools: RealtimeToolDef[];
+  // Forwarded to the inner RealtimeSession via the `{ ...opts }` spread —
+  // not read by this class itself.
+  reasoningEffort?: ReasoningEffort;
   callbacks: RealtimeCallbacks;
   urlOverride?: string;
   // Forwarded to the inner RealtimeSession via the `{ ...opts }` spread in

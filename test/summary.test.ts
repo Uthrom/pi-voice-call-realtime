@@ -214,6 +214,36 @@ describe("summarizeCall", () => {
     expect(result.summary).toContain("Summary unavailable:");
   });
 
+  it("POSTs to a custom OpenAI-compatible baseUrl when one is provided", async () => {
+    const { fetchImpl, requests } = fakeFetch([{ status: 200, body: chatCompletionBody("ok", "fine") }]);
+
+    await summarizeCall({
+      apiKey: "sk-local",
+      model: "my-local-model",
+      baseUrl: "https://llm.example.com/v1",
+      objective: "test",
+      transcript: "hi",
+      fetchImpl
+    });
+
+    expect(requests[0]!.url).toBe("https://llm.example.com/v1/chat/completions");
+  });
+
+  it("tolerates a trailing slash on baseUrl", async () => {
+    const { fetchImpl, requests } = fakeFetch([{ status: 200, body: chatCompletionBody("ok", "fine") }]);
+
+    await summarizeCall({
+      apiKey: "sk-local",
+      model: "my-local-model",
+      baseUrl: "https://llm.example.com/v1/",
+      objective: "test",
+      transcript: "hi",
+      fetchImpl
+    });
+
+    expect(requests[0]!.url).toBe("https://llm.example.com/v1/chat/completions");
+  });
+
   // Controller note (task instructions): the API key must never appear in
   // thrown/returned text or logs. Defense in depth: even a pathological
   // fetchImpl error that happens to embed the key must not leak it back out.

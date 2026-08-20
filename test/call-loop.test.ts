@@ -57,12 +57,12 @@ function tempHome(): string {
   return mkdtempSync(join(tmpdir(), "pi-voice-call-loop-"));
 }
 
-function makeConfig(home: string): Config {
+function makeConfig(home: string, summary?: Config["summary"]): Config {
   return {
     home,
     twilio: { accountSid: "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", authToken: AUTH_TOKEN, fromNumber: "+15559998888" },
-    openai: { apiKey: "sk-test", realtimeModel: "gpt-realtime", voice: "alloy" },
-    summaryModel: "gpt-4o-mini",
+    openai: { apiKey: "sk-test", realtimeModel: "gpt-realtime", voice: "alloy", reasoningEffort: "minimal" },
+    summary: summary ?? { model: "gpt-4o-mini", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test" },
     serve: { controlPort: 0, publicPort: 0, tunnel: "none", controlToken: "control-secret" },
     limits: { maxDurationSec: 900, maxConcurrentCalls: 1, dailyCallCap: 20 },
     defaults: { callerIdentity: "pi", amdPolicy: "leave-message" }
@@ -264,11 +264,17 @@ async function startAckOnlyRealtimeServer(): Promise<{ url: string }> {
 // passes through to the real global fetch. A blanket stub would silently
 // swallow the test's own local HTTP calls too, since summarizeCall reaches
 // `fetch` via the same global binding.
-function stubSummaryFetch(outcome: string, summary: string): void {
+function stubSummaryFetch(
+  outcome: string,
+  summary: string,
+  matchUrl = "https://api.openai.com/v1/chat/completions"
+): { requests: Array<{ url: string; init: RequestInit }> } {
+  const requests: Array<{ url: string; init: RequestInit }> = [];
   const realFetch = globalThis.fetch.bind(globalThis);
   const fetchStub = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    if (url === "https://api.openai.com/v1/chat/completions") {
+    if (url === matchUrl) {
+      requests.push({ url, init: init ?? {} });
       return new Response(
         JSON.stringify({ choices: [{ message: { content: JSON.stringify({ outcome, summary }) } }] }),
         { status: 200 }
@@ -277,6 +283,7 @@ function stubSummaryFetch(outcome: string, summary: string): void {
     return realFetch(input, init);
   });
   vi.stubGlobal("fetch", fetchStub);
+  return { requests };
 }
 
 /** Connects a plain `ws` client to a URL, tracked for teardown. */
@@ -312,7 +319,14 @@ describe("call loop (mock integration)", () => {
   it(
     "relays audio, dispatches note_outcome + end_call tool calls, drains playout before hangup, and finalizes the record with transcript + summary",
     async () => {
-      stubSummaryFetch("reservation confirmed", "Called and confirmed the 7pm reservation.");
+      // Summarizer configured against a custom OpenAI-compatible endpoint with
+      // its own key/model — proves the summary config is wired end-to-end
+      // (a miss here would fall back to "Summary unavailable" and fail below).
+      const summaryRequests = stubSummaryFetch(
+        "reservation confirmed",
+        "Called and confirmed the 7pm reservation.",
+        "https://summarizer.example.com/v1/chat/completions"
+      ).requests;
 
       const audioBuffer = Buffer.from([0x01, 0x02, 0x03, 0xff, 0x7e]);
       const { url: realtimeUrl } = await startScriptedRealtimeServer({
@@ -325,10 +339,21 @@ describe("call loop (mock integration)", () => {
 
       const home = tempHome();
       const provider = new MockProvider();
-      const h = await startServer(makeConfig(home), {
-        provider,
-        realtimeFactory: (opts) => new RealtimeSession({ ...opts, urlOverride: realtimeUrl, connectTimeoutMs: 2000 })
-      });
+      let realtimeOpts: ConstructorParameters<typeof RealtimeSession>[0] | undefined;
+      const h = await startServer(
+        makeConfig(home, {
+          model: "summary-model-x",
+          baseUrl: "https://summarizer.example.com/v1",
+          apiKey: "sk-summary-test"
+        }),
+        {
+          provider,
+          realtimeFactory: (opts) => {
+            realtimeOpts = opts;
+            return new RealtimeSession({ ...opts, urlOverride: realtimeUrl, connectTimeoutMs: 2000 });
+          }
+        }
+      );
       handle = h;
       const port = (h.publicServer.address() as AddressInfo).port;
       const baseUrl = `http://127.0.0.1:${port}`;
@@ -406,6 +431,17 @@ describe("call loop (mock integration)", () => {
       expect(finalRec?.outcome).toEqual({ outcome: "reservation confirmed", details: "confirmed for 7pm" });
       expect(finalRec?.summary).toBe("Called and confirmed the 7pm reservation.");
       expect(finalRec?.transcriptPath).toBeTruthy();
+
+      // The session passed the config's reasoning effort through to the
+      // realtime layer.
+      expect(realtimeOpts?.reasoningEffort).toBe("minimal");
+
+      // The summarizer used the summary block's own key and model, not the
+      // realtime openai credentials.
+      expect(summaryRequests).toHaveLength(1);
+      const summaryHeaders = summaryRequests[0]!.init.headers as Record<string, string>;
+      expect(summaryHeaders.Authorization).toBe("Bearer sk-summary-test");
+      expect(JSON.parse(summaryRequests[0]!.init.body as string).model).toBe("summary-model-x");
 
       const transcriptContents = await readFile(finalRec!.transcriptPath!, "utf-8");
       expect(transcriptContents).toContain("Your reservation for 7pm is confirmed. Goodbye.");
