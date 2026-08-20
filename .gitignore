@@ -7,5 +7,6 @@ coverage/
 .DS_Store
 config.json
 .superpowers/
+docs/superpowers/
 .reference/
 .pi-voice/

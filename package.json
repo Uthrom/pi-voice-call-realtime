@@ -1,6 +1,12 @@
 {
   "name": "pi-voice-call-realtime",
   "version": "0.1.0",
+  "description": "Outbound phone calls for the pi coding agent via Twilio and the OpenAI Realtime API",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Uthrom/pi-voice-call-realtime.git"
+  },
+  "author": "Dominic Eidson",
   "type": "module",
   "license": "MIT",
   "engines": {
